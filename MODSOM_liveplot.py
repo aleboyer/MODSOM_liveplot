@@ -52,7 +52,12 @@ ADC_VREF_SHEAR = 2.5
 ADC_VREF_ACCEL = 1.8
 ACC_OFFSET = 1.8 / 2
 ACC_FACTOR = 0.4
-
+# ----------------------------------------------------------------------
+# TTV dimension and angle to compute beam velocities ()
+# ----------------------------------------------------------------------
+TTV_SPACE = 0.0382
+TTV_ANGLE2VERTICAL = 53
+TTV_ANGLE2HORIZONTAL = 90-TTV_ANGLE2VERTICAL
 
 def bytes3_to_signed_int(b: bytes) -> int:
     """
@@ -168,6 +173,7 @@ class TTVData(BaseInstrumentData):
     errorcode: List[int] = field(default_factory=list)
     upstream_adcpeak: List[int] = field(default_factory=list)
     downstream_adcpeak: List[int] = field(default_factory=list)
+    beam_vel: List[int] = field(default_factory=list)
     raw_payloads: List[bytes] = field(default_factory=list)
 
 
@@ -216,8 +222,9 @@ class ProcessedTTVData(BaseInstrumentData):
     beam1: List[float] = field(default_factory=list)
     beam2: List[float] = field(default_factory=list)
     beam3: List[float] = field(default_factory=list)
-    Xvel: List[float] = field(default_factory=list)
-    Yvel: List[float] = field(default_factory=list)
+    X1vel: List[float] = field(default_factory=list)
+    X2vel: List[float] = field(default_factory=list)
+    X3vel: List[float] = field(default_factory=list)
     Z1vel: List[float] = field(default_factory=list)
     Z2vel: List[float] = field(default_factory=list)
     Z3vel: List[float] = field(default_factory=list)
@@ -487,12 +494,15 @@ class RecordProcessorThread(threading.Thread):
                 # tolerate
                 pass
 
+            beam_vel = TTV_SPACE/2 * dtof / (tof_up * tof_down)
+
             inst.tof_up.append(tof_up)
             inst.tof_down.append(tof_down)
             inst.dtof.append(dtof)
             inst.errorcode.append(int(errorcode))
             inst.upstream_adcpeak.append(int(upstream_adcpeak))
             inst.downstream_adcpeak.append(int(downstream_adcpeak))
+            inst.beam_vel.append(beam_vel)
 
         if self.processed_queue is not None:
             # send the inst structure (already contains newly appended samples)
@@ -626,8 +636,7 @@ class ProcessedProcessorThread(threading.Thread):
         }
 
         # constants
-        self.L = 0.0382
-        self.theta_deg = 90.0 - 53.0
+        self.theta_deg = 90.0 - TTV_ANGLE2VERTICAL
         self.cos_theta = float(np.cos(np.deg2rad(self.theta_deg)))
         self.sin_theta = float(np.sin(np.deg2rad(self.theta_deg)))
 
@@ -688,24 +697,21 @@ class ProcessedProcessorThread(threading.Thread):
 
         # Process only new samples [i0:n)
         for i in range(i0, n):
-            tof_up = inst.tof_up[i]
-            tof_dn = inst.tof_down[i]
-            dtof = inst.dtof[i]
-
-            denom = tof_up * tof_dn
-            if denom == 0 or not np.isfinite(denom):
-                continue
-
-            v = (self.L / 2.0) * (dtof / denom)
-            if not np.isfinite(v):
-                continue
-
             out.sample_posix.append(inst.sample_posix[i])
             out.sample_dnum.append(inst.sample_dnum[i])
-            out.beam1.append(float(v))
-            out.Xvel.append(float(v * self.sin_theta))
-            out.Z1vel.append(float(v * self.cos_theta))
-            out.src_tag.append(tag)
+            if tag == "TTV1":
+                out.X1vel.append(float(inst.beam_vel[i] * self.sin_theta))
+                out.Z1vel.append(float(inst.beam_vel[i] * self.cos_theta))
+                out.beam1.append(inst.beam_vel[i])
+
+            elif tag == "TTV2":
+                out.X2vel.append(float(inst.beam_vel[i] * self.sin_theta))
+                out.Z2vel.append(float(inst.beam_vel[i] * self.cos_theta))
+                out.beam2.append(inst.beam_vel[i])
+            elif tag == "TTV3":
+                out.X3vel.append(float(inst.beam_vel[i] * self.sin_theta))
+                out.Z3vel.append(float(inst.beam_vel[i] * self.cos_theta))
+                out.beam3.append(inst.beam_vel[i])
 
         # Update last processed index for this tag
         self._last_idx[tag] = n
@@ -1407,8 +1413,8 @@ class TTVProcessedWindow(QtWidgets.QMainWindow):
             return
 
         t = np.asarray(self.data.sample_posix, dtype=float)
-        v = np.asarray(self.data.beam1_vel, dtype=float)
-        vcos = np.asarray(self.data.beam1_vel_cos, dtype=float)
+        v = np.asarray(self.data.beam_vel, dtype=float)
+        vcos = np.asarray(self.data.beam_vel_cos, dtype=float)
         tags = np.asarray(self.data.src_tag)
 
         if t.size < 2:
@@ -1557,7 +1563,7 @@ def main():
     processed_processor = ProcessedProcessorThread(processed_queue, stop_event)
     processed_processor.start()
 
-    record_processor = RecordProcessorThread(record_queue, stop_event)
+    record_processor = RecordProcessorThread(record_queue, stop_event, processed_queue)
     record_processor.start()
 
     parser = EpsiStateMachineParser(record_queue)
