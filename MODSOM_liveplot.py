@@ -1,4 +1,24 @@
 #!/usr/bin/env python3
+"""
+modsom_liveplot.py
+
+Reads MODSOM framed records ($TAG + header checksum + payload + payload checksum)
+from file / serial / TCP, parses instruments, and live-plots with pyqtgraph.
+
+NEW in this version:
+- Adds $DCAL support (SBE49 calibration record at start of stream)
+- Adds $SB49 support:
+    * parses SB49 payload elements: 16-hex timestamp + 24-byte raw sample
+    * converts raw -> physical units (T [°C], P [dbar], C [S/m], S [psu (approx)])
+    * plots T/P/S live like other instruments
+
+Assumptions:
+- Generator sends one DCAL record right at stream start.
+- SB49 payload contains N elements; each element is:
+    16 ASCII hex timestamp_ms
+    + 24 bytes ASCII raw sample: "ttttttccccccppppppvvvv\r\n"
+"""
+
 import argparse
 import threading
 import queue
@@ -6,12 +26,13 @@ import time
 import struct
 import signal
 import socket
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from PyQt5 import QtCore, QtWidgets, QtGui
+from PyQt5 import QtCore, QtWidgets
 import pyqtgraph as pg
 
 try:
@@ -19,21 +40,27 @@ try:
 except ImportError:
     serial = None
 
+
+# =============================================================================
+# Tags
+# =============================================================================
 VALID_TAGS = {
+    b"DCAL",  # NEW
     b"EFE4",
     b"TTV1",
     b"TTV2",
     b"TTV3",
     b"VNAV",
-    b"SB49",
+    b"SB49",  # already present, now parsed
     b"SB41",
     b"ECOP",
     b"SOM3",
 }
 
-# ----------------------------------------------------------------------
+
+# =============================================================================
 # Time conversion
-# ----------------------------------------------------------------------
+# =============================================================================
 MATLAB_EPOCH_DNUM = 719529.0  # datenum('1970-01-01')
 SECONDS_PER_DAY = 86400.0
 
@@ -42,115 +69,318 @@ def posix_to_matlab_dnum(posix_seconds: float) -> float:
     return posix_seconds / SECONDS_PER_DAY + MATLAB_EPOCH_DNUM
 
 
-# ----------------------------------------------------------------------
-# ADC conversion helpers (3-byte signed, 24-bit)
-# ----------------------------------------------------------------------
-ADC_FULL_SCALE_COUNTS = 2 ** 24  # using 24-bit range for unipolar
-ADC_FULL_SCALE_COUNTS_M1 = 2 ** 23  # for bipolar scaling
+# =============================================================================
+# ADC conversion helpers (EFE4)
+# =============================================================================
+ADC_FULL_SCALE_COUNTS = 2 ** 24
+ADC_FULL_SCALE_COUNTS_M1 = 2 ** 23
 ADC_VREF_TEMP = 2.5
 ADC_VREF_SHEAR = 2.5
 ADC_VREF_ACCEL = 1.8
 ACC_OFFSET = 1.8 / 2
 ACC_FACTOR = 0.4
-# ----------------------------------------------------------------------
-# TTV dimension and angle to compute beam velocities ()
-# ----------------------------------------------------------------------
-TTV_SPACE = 0.0382
-TTV_ANGLE2VERTICAL = 53
-TTV_ANGLE2HORIZONTAL = 90-TTV_ANGLE2VERTICAL
+
 
 def bytes3_to_signed_int(b: bytes) -> int:
-    """
-    Convert 3 bytes (big-endian) to a 24-bit integer.
-    (You can reintroduce sign handling here if needed.)
-    """
     if len(b) != 3:
         raise ValueError("bytes3_to_signed_int expects exactly 3 bytes")
-    raw = int.from_bytes(b, byteorder="big", signed=False)
-    return raw
+    return int.from_bytes(b, byteorder="big", signed=False)
 
 
 def counts24_to_volts_unipolar(counts: int, full_range: float) -> float:
-    """
-    Unipolar: FullRange * COUNTS / 2^24
-    """
     return (counts / ADC_FULL_SCALE_COUNTS) * full_range
 
 
 def counts24_to_volts_bipolar(counts: int, full_range: float) -> float:
-    """
-    Bipolar: FullRange * COUNTS / 2^(24-1)
-    """
     return (counts / ADC_FULL_SCALE_COUNTS_M1) * full_range
 
 
 def volts_to_g(acc_volts: float) -> float:
-    """
-    Convert accelerometer volts to g:
-      g = (V - offset) / factor
-    """
     return (acc_volts - ACC_OFFSET) / ACC_FACTOR
 
 
-# ----------------------------------------------------------------------
-# Color maps
-# ----------------------------------------------------------------------
+# =============================================================================
+# TTV constants
+# =============================================================================
+TTV_SPACE = 0.0382
+TTV_ANGLE2VERTICAL = 53
+TTV_ANGLE2HORIZONTAL = 90 - TTV_ANGLE2VERTICAL
+
+
+# =============================================================================
+# SBE49 / DCAL
+# =============================================================================
+C3515_MSCM = 42.914  # mS/cm
+C3515_SM = C3515_MSCM / 10.0  # S/m (since 1 S/m = 10 mS/cm)
+
+
+@dataclass
+class SBE49Cal:
+    serial_no: str = ""
+    temperature_date: str = ""
+    conductivity_date: str = ""
+    pressure_date: str = ""
+    pressure_sn: str = ""
+    pressure_range_psia: float = 0.0
+
+    # temperature
+    ta0: float = 0.0
+    ta1: float = 0.0
+    ta2: float = 0.0
+    ta3: float = 0.0
+    toffset: float = 0.0
+
+    # conductivity
+    g: float = 0.0
+    h: float = 0.0
+    i: float = 0.0
+    j: float = 0.0
+    tcor: float = 0.0
+    pcor: float = 0.0
+    cslope: float = 1.0
+
+    # pressure
+    pa0: float = 0.0
+    pa1: float = 0.0
+    pa2: float = 0.0
+    ptempa0: float = 0.0
+    ptempa1: float = 0.0
+    ptempa2: float = 0.0
+    ptca0: float = 0.0
+    ptca1: float = 0.0
+    ptca2: float = 0.0
+    ptcb0: float = 0.0
+    ptcb1: float = 0.0
+    ptcb2: float = 0.0
+    poffset: float = 0.0
+
+    # a quick flag
+    valid: bool = False
+
+
+def parse_dcal_payload(payload: bytes) -> SBE49Cal:
+    """
+    Parse ASCII DCAL payload into a SBE49Cal structure.
+
+    Works with your example formatting; tolerant of extra spaces.
+    """
+    txt = payload.decode("ascii", errors="ignore")
+
+    cal = SBE49Cal()
+
+    # Header-ish fields
+    m = re.search(r"SERIAL\s+NO\.\s*([0-9]+)", txt, flags=re.IGNORECASE)
+    if m:
+        cal.serial_no = m.group(1).strip()
+
+    m = re.search(r"temperature:\s*([0-9A-Za-z\-]+)", txt, flags=re.IGNORECASE)
+    if m:
+        cal.temperature_date = m.group(1).strip()
+
+    m = re.search(r"conductivity:\s*([0-9A-Za-z\-]+)", txt, flags=re.IGNORECASE)
+    if m:
+        cal.conductivity_date = m.group(1).strip()
+
+    m = re.search(r"pressure\s+S/N\s*=\s*([0-9]+).*?range\s*=\s*([0-9.]+)\s*psia:\s*([0-9A-Za-z\-]+)", txt, flags=re.IGNORECASE)
+    if m:
+        cal.pressure_sn = m.group(1).strip()
+        try:
+            cal.pressure_range_psia = float(m.group(2))
+        except Exception:
+            cal.pressure_range_psia = 0.0
+        cal.pressure_date = m.group(3).strip()
+
+    # Key=Value parsing (handles scientific notation)
+    kv = {}
+    for line in txt.splitlines():
+        mm = re.search(r"^\s*([A-Za-z0-9_]+)\s*=\s*([+\-]?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?)\s*$", line)
+        if mm:
+            kv[mm.group(1).upper()] = float(mm.group(2))
+
+    # Temperature
+    cal.ta0 = kv.get("TA0", 0.0)
+    cal.ta1 = kv.get("TA1", 0.0)
+    cal.ta2 = kv.get("TA2", 0.0)
+    cal.ta3 = kv.get("TA3", 0.0)
+    cal.toffset = kv.get("TOFFSET", 0.0)
+
+    # Conductivity
+    cal.g = kv.get("G", 0.0)
+    cal.h = kv.get("H", 0.0)
+    cal.i = kv.get("I", 0.0)
+    cal.j = kv.get("J", 0.0)
+    cal.pcor = kv.get("CPCOR", 0.0)
+    cal.tcor = kv.get("CTCOR", 0.0)
+    cal.cslope = kv.get("CSLOPE", 1.0)
+
+    # Pressure
+    cal.pa0 = kv.get("PA0", 0.0)
+    cal.pa1 = kv.get("PA1", 0.0)
+    cal.pa2 = kv.get("PA2", 0.0)
+    cal.ptca0 = kv.get("PTCA0", 0.0)
+    cal.ptca1 = kv.get("PTCA1", 0.0)
+    cal.ptca2 = kv.get("PTCA2", 0.0)
+    cal.ptcb0 = kv.get("PTCB0", 0.0)
+    cal.ptcb1 = kv.get("PTCB1", 0.0)
+    cal.ptcb2 = kv.get("PTCB2", 0.0)
+    cal.ptempa0 = kv.get("PTEMPA0", 0.0)
+    cal.ptempa1 = kv.get("PTEMPA1", 0.0)
+    cal.ptempa2 = kv.get("PTEMPA2", 0.0)
+    cal.poffset = kv.get("POFFSET", 0.0)
+
+    # Minimal sanity check
+    cal.valid = (cal.ta1 != 0.0) and (cal.g != 0.0) and (cal.pa1 != 0.0) and (cal.ptca0 != 0.0) and (cal.ptcb0 != 0.0)
+    return cal
+
+
+def sbe49_raw_to_temperature(T_raw: int, cal: SBE49Cal) -> float:
+    # Matlab:
+    # mv = (T_raw-524288)/1.6e7;
+    # r = (mv*2.295e10 + 9.216e8)./(6.144e4-mv*5.3e5);
+    # T = a0+a1*log(r)+a2*log(r).^2+a3*log(r).^3;
+    # T = 1./T - 273.15;
+    mv = (float(T_raw) - 524288.0) / 1.6e7
+    denom = (6.144e4 - mv * 5.3e5)
+    if denom == 0:
+        denom = 1e-12
+    r = (mv * 2.295e10 + 9.216e8) / denom
+    if r <= 0:
+        r = 1e-12
+    lr = math.log(r)
+    invT = cal.ta0 + cal.ta1 * lr + cal.ta2 * (lr ** 2) + cal.ta3 * (lr ** 3)
+    if invT == 0:
+        invT = 1e-12
+    return (1.0 / invT) - 273.15
+
+
+def sbe49_raw_to_pressure(P_raw: int, PT_raw: int, cal: SBE49Cal) -> float:
+    # Matlab:
+    # y = PT_raw/13107;
+    # t = ptempa0+ptempa1*y+ptempa2*y.^2;
+    # x = P_raw-ptca0-ptca1*t-ptca2*t.^2;
+    # n = x*ptcb0./(ptcb0+ptcb1*t+ptcb2*t.^2);
+    # P = (pa0+pa1*n+pa2*n.^2-14.7)*0.689476;
+    y = float(PT_raw) / 13107.0
+    t = cal.ptempa0 + cal.ptempa1 * y + cal.ptempa2 * (y ** 2)
+    x = float(P_raw) - cal.ptca0 - cal.ptca1 * t - cal.ptca2 * (t ** 2)
+    denom = (cal.ptcb0 + cal.ptcb1 * t + cal.ptcb2 * (t ** 2))
+    if denom == 0:
+        denom = 1e-12
+    n = x * cal.ptcb0 / denom
+    P = (cal.pa0 + cal.pa1 * n + cal.pa2 * (n ** 2) - 14.7) * 0.689476
+    return P
+
+
+def sbe49_raw_to_conductivity(C_raw: int, T_C: float, P_dbar: float, cal: SBE49Cal) -> float:
+    # Matlab:
+    # f = C_raw/256/1000;
+    # C = (g+h*f.^2+i*f.^3+j*f.^4)./(1+tcor.*T+pcor.*P);
+    f = float(C_raw) / 256.0 / 1000.0
+    num = cal.g + cal.h * (f ** 2) + cal.i * (f ** 3) + cal.j * (f ** 4)
+    den = 1.0 + cal.tcor * float(T_C) + cal.pcor * float(P_dbar)
+    if den == 0:
+        den = 1e-12
+    return num / den  # S/m
+
+
+def salinity_from_conductivity_simple(C_Sm: float, T_C: float, P_dbar: float) -> float:
+    """
+    Practical salinity approximation for live plotting:
+    - Use conductivity ratio R = C / C(35,15,0)
+    - Apply UNESCO 1983 polynomial at P=0 (no pressure correction), using your sw_sals form.
+
+    This matches your MATLAB sw_sals() core and is "good enough" for visualization.
+    """
+    Rt = float(C_Sm) / C3515_SM
+    # sw_sals (from your pasted code)
+    del_T68 = (T_C * 1.00024) - 15.0
+    a0 = 0.0080
+    a1 = -0.1692
+    a2 = 25.3851
+    a3 = 14.0941
+    a4 = -7.0261
+    a5 = 2.7081
+    b0 = 0.0005
+    b1 = -0.0056
+    b2 = -0.0066
+    b3 = -0.0375
+    b4 = 0.0636
+    b5 = -0.0144
+    k = 0.0162
+
+    if Rt < 0:
+        Rt = 0.0
+    Rtx = math.sqrt(Rt)
+    del_S = (del_T68 / (1.0 + k * del_T68)) * (
+        b0 + (b1 + (b2 + (b3 + (b4 + b5 * Rtx) * Rtx) * Rtx) * Rtx) * Rtx
+    )
+    S = a0 + (a1 + (a2 + (a3 + (a4 + a5 * Rtx) * Rtx) * Rtx) * Rtx) * Rtx
+    return S + del_S
+
+
+# =============================================================================
+# Colors
+# =============================================================================
 EFE4_COLORS = {
-    "t1": (255, 0, 0),  # red
-    "t2": (255, 165, 0),  # orange
-    "s1": (0, 0, 255),  # blue
-    "s2": (0, 255, 255),  # cyan
-    "a1": (0, 255, 0),  # green
-    "a2": (255, 0, 255),  # magenta
-    "a3": (139, 69, 19),  # brown
+    "t1": (255, 0, 0),
+    "t2": (255, 165, 0),
+    "s1": (0, 0, 255),
+    "s2": (0, 255, 255),
+    "a1": (0, 255, 0),
+    "a2": (255, 0, 255),
+    "a3": (139, 69, 19),
 }
 
 TTV_TAG_COLORS = {
-    "TTV1": (255, 0, 0),  # red
-    "TTV2": (0, 255, 0),  # green
-    "TTV3": (0, 0, 255),  # blue
+    "TTV1": (255, 0, 0),
+    "TTV2": (0, 255, 0),
+    "TTV3": (0, 0, 255),
 }
 
 VNAV_COLORS = {
     "mag_x": (255, 0, 0),
     "mag_y": (0, 255, 0),
     "mag_z": (0, 0, 255),
-
     "accel_x": (255, 0, 255),
     "accel_y": (0, 255, 255),
     "accel_z": (255, 255, 0),
-
     "gyro_x": (255, 165, 0),
     "gyro_y": (128, 0, 128),
     "gyro_z": (0, 128, 0),
 }
 
+SB49_COLORS = {
+    "T": (255, 0, 0),
+    "P": (0, 255, 0),
+    "S": (0, 0, 255),
+    "C": (255, 165, 0),
+}
 
-# ----------------------------------------------------------------------
+
+# =============================================================================
 # Data structures
-# ----------------------------------------------------------------------
+# =============================================================================
 @dataclass
 class Record:
-    """Single record emitted by the parser."""
-    inst_tag: str  # e.g. "EFE4", "TTV1"
-    posix: float  # POSIX seconds since 1970-01-01 (header timestamp / 1000)
-    dnum: float  # MATLAB datenum
-    payload_size: int  # payload size in bytes
-    payload: bytes  # raw payload bytes
+    inst_tag: str
+    posix: float
+    dnum: float
+    payload_size: int
+    payload: bytes
 
 
 @dataclass
 class BaseInstrumentData:
-    """
-    Base instrument data:
-      - record_* are timestamps at record level (per header)
-      - sample_* are timestamps at sample level (inside each record)
-    """
     record_posix: List[float] = field(default_factory=list)
     record_dnum: List[float] = field(default_factory=list)
-
     sample_posix: List[float] = field(default_factory=list)
     sample_dnum: List[float] = field(default_factory=list)
+
+
+@dataclass
+class DCALData(BaseInstrumentData):
+    raw_text: List[str] = field(default_factory=list)
+    cal: Optional[SBE49Cal] = None
 
 
 @dataclass
@@ -173,12 +403,24 @@ class TTVData(BaseInstrumentData):
     errorcode: List[int] = field(default_factory=list)
     upstream_adcpeak: List[int] = field(default_factory=list)
     downstream_adcpeak: List[int] = field(default_factory=list)
-    beam_vel: List[int] = field(default_factory=list)
+    beam_vel: List[float] = field(default_factory=list)
     raw_payloads: List[bytes] = field(default_factory=list)
 
 
 @dataclass
 class SB49Data(BaseInstrumentData):
+    # raw fields
+    T_raw: List[int] = field(default_factory=list)
+    C_raw: List[int] = field(default_factory=list)
+    P_raw: List[int] = field(default_factory=list)
+    PT_raw: List[int] = field(default_factory=list)
+
+    # physical
+    T: List[float] = field(default_factory=list)   # degC
+    P: List[float] = field(default_factory=list)   # dbar
+    C: List[float] = field(default_factory=list)   # S/m
+    S: List[float] = field(default_factory=list)   # psu (approx)
+
     raw_payloads: List[bytes] = field(default_factory=list)
 
 
@@ -211,62 +453,21 @@ class SOM3Data(BaseInstrumentData):
     raw_payloads: List[bytes] = field(default_factory=list)
 
 
-@dataclass
-class ProcessedTTVData(BaseInstrumentData):
-    """
-    Processed TTV products (per-sample).
-    Beam1 velocity:
-      v = (L/2) * dtof / (tof_up * tof_down)
-    Also store v*cos(theta) for comparison.
-    """
-    beam1: List[float] = field(default_factory=list)
-    beam2: List[float] = field(default_factory=list)
-    beam3: List[float] = field(default_factory=list)
-    X1vel: List[float] = field(default_factory=list)
-    X2vel: List[float] = field(default_factory=list)
-    X3vel: List[float] = field(default_factory=list)
-    Z1vel: List[float] = field(default_factory=list)
-    Z2vel: List[float] = field(default_factory=list)
-    Z3vel: List[float] = field(default_factory=list)
-    # optional: track which tag produced each sample (useful later for colors)
-    src_tag: List[str] = field(default_factory=list)
-
-
-@dataclass
-class ProcessedEFEData(BaseInstrumentData):
-    """Placeholder for processed EFE data."""
-    pass
-
-
-@dataclass
-class ProcessedVNAVData(BaseInstrumentData):
-    """Placeholder for processed VNAV data."""
-    pass
-
-
-# ----------------------------------------------------------------------
+# =============================================================================
 # Reader thread: file / serial / tcp socket
-# ----------------------------------------------------------------------
+# =============================================================================
 class ByteSourceThread(threading.Thread):
-    """
-    Reads bytes from either:
-      - file object  (read)
-      - serial port  (read/write/flush)
-      - TCP socket   (recv)
-    and pushes chunks into out_queue.
-    """
-
     def __init__(
-            self,
-            source,
-            mode: str,  # "file" | "serial" | "tcp"
-            out_queue: queue.Queue,
-            stop_event: threading.Event,
-            chunk_size: int = 4096,
-            start_command: Optional[bytes] = b"som.start\r\n",
-            stop_command: Optional[bytes] = b"som.stop\r\n",
-            start_command_delay_s: float = 0.05,
-            clear_input_before_start: bool = True,
+        self,
+        source,
+        mode: str,  # "file" | "serial" | "tcp"
+        out_queue: queue.Queue,
+        stop_event: threading.Event,
+        chunk_size: int = 4096,
+        start_command: Optional[bytes] = b"som.start\r\n",
+        stop_command: Optional[bytes] = b"som.stop\r\n",
+        start_command_delay_s: float = 0.05,
+        clear_input_before_start: bool = True,
     ):
         super().__init__(daemon=True)
         self.source = source
@@ -291,7 +492,6 @@ class ByteSourceThread(threading.Thread):
 
     def run(self):
         try:
-            # Serial: send start
             if self.mode == "serial" and self.start_command:
                 try:
                     if self.clear_input_before_start and hasattr(self.source, "reset_input_buffer"):
@@ -322,423 +522,24 @@ class ByteSourceThread(threading.Thread):
         except Exception as e:
             print(f"[ByteSourceThread] Error: {e}")
         finally:
-            # Always try to send som.stop on serial if we are stopping
             if self.mode == "serial" and self.stop_command:
                 self._send_serial_cmd(self.stop_command)
-
-            # signal EOF to consumer
             self.out_queue.put(None)
 
 
-# ----------------------------------------------------------------------
-# Record processing thread
-# ----------------------------------------------------------------------
-class RecordProcessorThread(threading.Thread):
-    def __init__(self, in_queue: queue.Queue, stop_event: threading.Event,
-                 processed_queue: Optional[queue.Queue] = None):
-        super().__init__(daemon=True)
-        self.in_queue = in_queue
-        self.stop_event = stop_event
-        self.processed_queue = processed_queue
-
-        self.instruments: Dict[str, BaseInstrumentData] = {
-            "EFE4": EFE4Data(),
-            "TTV1": TTVData(),
-            "TTV2": TTVData(),
-            "TTV3": TTVData(),
-            "SB49": SB49Data(),
-            "SB41": SB41Data(),
-            "VNAV": VNAVData(),
-            "ECOP": ECOPData(),
-            "SOM3": SOM3Data(),
-        }
-
-    def run(self):
-        while not self.stop_event.is_set():
-            rec = self.in_queue.get()
-            if rec is None:
-                break
-            self._process_record(rec)
-
-    def _process_record(self, rec: Record):
-        tag = rec.inst_tag
-        if tag not in self.instruments:
-            return
-
-        if tag == "EFE4":
-            self._parse_efe4_record(rec, self.instruments["EFE4"])
-        elif tag in ("TTV1", "TTV2", "TTV3"):
-            self._parse_ttv_record(rec, self.instruments[tag], tag)
-        elif tag == "SB49":
-            self._parse_sb49_record(rec, self.instruments["SB49"])
-        elif tag == "SB41":
-            self._parse_sb41_record(rec, self.instruments["SB41"])
-        elif tag == "VNAV":
-            self._parse_vnav_record(rec, self.instruments["VNAV"])
-        elif tag == "ECOP":
-            self._parse_ecop_record(rec, self.instruments["ECOP"])
-        elif tag == "SOM3":
-            self._parse_som3_record(rec, self.instruments["SOM3"])
-
-    # ---------------- Instrument parsers ------------------
-
-    def _parse_efe4_record(self, rec: Record, inst: EFE4Data):
-        inst.record_posix.append(rec.posix)
-        inst.record_dnum.append(rec.dnum)
-        inst.raw_payloads.append(rec.payload)
-
-        payload = rec.payload
-        SAMPLE_BYTES = 8 + 3 * 7
-        n_samples = len(payload) // SAMPLE_BYTES
-
-        if n_samples == 0:
-            if len(payload) > 0:
-                print(f"[EFE4] Warning: payload length {len(payload)} not a multiple of {SAMPLE_BYTES}")
-            return
-
-        if len(payload) % SAMPLE_BYTES != 0:
-            print(
-                f"[EFE4] Warning: payload length {len(payload)} not divisible by {SAMPLE_BYTES}. Using first {n_samples} samples.")
-
-        for i in range(n_samples):
-            offset = i * SAMPLE_BYTES
-            sample_ts_bytes = payload[offset: offset + 8]
-            chan_bytes = payload[offset + 8: offset + SAMPLE_BYTES]
-
-            if len(sample_ts_bytes) != 8 or len(chan_bytes) != 3 * 7:
-                print("[EFE4] Incomplete sample encountered, stopping.")
-                break
-
-            sample_ts_ms = int.from_bytes(sample_ts_bytes, byteorder="little", signed=False)
-            sample_posix = sample_ts_ms / 1000.0
-            sample_dnum = posix_to_matlab_dnum(sample_posix)
-            inst.sample_posix.append(sample_posix)
-            inst.sample_dnum.append(sample_dnum)
-
-            c_t1 = bytes3_to_signed_int(chan_bytes[0:3])
-            c_t2 = bytes3_to_signed_int(chan_bytes[3:6])
-            c_s1 = bytes3_to_signed_int(chan_bytes[6:9])
-            c_s2 = bytes3_to_signed_int(chan_bytes[9:12])
-            c_a1 = bytes3_to_signed_int(chan_bytes[12:15])
-            c_a2 = bytes3_to_signed_int(chan_bytes[15:18])
-            c_a3 = bytes3_to_signed_int(chan_bytes[18:21])
-
-            inst.t1.append(counts24_to_volts_unipolar(c_t1, ADC_VREF_TEMP))
-            inst.t2.append(counts24_to_volts_unipolar(c_t2, ADC_VREF_TEMP))
-            inst.s1.append(counts24_to_volts_bipolar(c_s1, ADC_VREF_SHEAR))
-            inst.s2.append(counts24_to_volts_bipolar(c_s2, ADC_VREF_SHEAR))
-            inst.a1.append(volts_to_g(counts24_to_volts_unipolar(c_a1, ADC_VREF_ACCEL)))
-            inst.a2.append(volts_to_g(counts24_to_volts_unipolar(c_a2, ADC_VREF_ACCEL)))
-            inst.a3.append(volts_to_g(counts24_to_volts_unipolar(c_a3, ADC_VREF_ACCEL)))
-
-    def _parse_ttv_record(self, rec: Record, inst: TTVData, tag: str):
-        inst.record_posix.append(rec.posix)
-        inst.record_dnum.append(rec.dnum)
-        inst.raw_payloads.append(rec.payload)
-
-        payload = rec.payload
-        PACKET_SIZE = 16 + 4 + 4 + 4 + 1 + 2 + 2 + 2  # 35 bytes (includes CRLF)
-
-        if len(payload) < PACKET_SIZE:
-            if len(payload) > 0:
-                print(
-                    f"[{tag}] Warning: payload length {len(payload)} smaller than one TTV sample ({PACKET_SIZE} bytes)")
-            return
-
-        n_packets = len(payload) // PACKET_SIZE
-        if len(payload) % PACKET_SIZE != 0:
-            print(
-                f"[{tag}] Warning: payload length {len(payload)} not divisible by {PACKET_SIZE}. Using first {n_packets} samples.")
-
-        for i in range(n_packets):
-            offset = i * PACKET_SIZE
-            chunk = payload[offset: offset + PACKET_SIZE]
-            if len(chunk) < PACKET_SIZE:
-                break
-
-            ts_hex_bytes = chunk[0:16]
-            try:
-                ts_ms = int(ts_hex_bytes.decode("ascii", errors="ignore"), 16)
-            except ValueError:
-                print(f"[{tag}] Invalid hex timestamp in sample {i}: {ts_hex_bytes!r}")
-                continue
-
-            sample_posix = ts_ms / 1000.0
-            sample_dnum = posix_to_matlab_dnum(sample_posix)
-            inst.sample_posix.append(sample_posix)
-            inst.sample_dnum.append(sample_dnum)
-
-            idx = 16
-            tof_up_bytes = chunk[idx: idx + 4]
-            idx += 4
-            tof_down_bytes = chunk[idx: idx + 4]
-            idx += 4
-            dtof_bytes = chunk[idx: idx + 4]
-            idx += 4
-
-            # NOTE: you used big-endian. If values look wrong, switch to "<f".
-            tof_up = struct.unpack(">f", tof_up_bytes)[0]
-            tof_down = struct.unpack(">f", tof_down_bytes)[0]
-            dtof = struct.unpack(">f", dtof_bytes)[0]
-
-            errorcode = chunk[idx]
-            idx += 1
-
-            upstream_adcpeak = struct.unpack(">H", chunk[idx: idx + 2])[0]
-            idx += 2
-            downstream_adcpeak = struct.unpack(">H", chunk[idx: idx + 2])[0]
-            idx += 2
-
-            crlf = chunk[idx: idx + 2]
-            if crlf not in (b"\r\n", b"\n\r"):
-                # tolerate
-                pass
-
-            beam_vel = TTV_SPACE/2 * dtof / (tof_up * tof_down)
-
-            inst.tof_up.append(tof_up)
-            inst.tof_down.append(tof_down)
-            inst.dtof.append(dtof)
-            inst.errorcode.append(int(errorcode))
-            inst.upstream_adcpeak.append(int(upstream_adcpeak))
-            inst.downstream_adcpeak.append(int(downstream_adcpeak))
-            inst.beam_vel.append(beam_vel)
-
-        if self.processed_queue is not None:
-            # send the inst structure (already contains newly appended samples)
-            self.processed_queue.put((tag, inst))
-
-    def _parse_sb49_record(self, rec: Record, inst: SB49Data):
-        inst.record_posix.append(rec.posix)
-        inst.record_dnum.append(rec.dnum)
-        inst.raw_payloads.append(rec.payload)
-
-    def _parse_sb41_record(self, rec: Record, inst: SB41Data):
-        inst.record_posix.append(rec.posix)
-        inst.record_dnum.append(rec.dnum)
-        inst.raw_payloads.append(rec.payload)
-
-    def _parse_vnav_record(self, rec: Record, inst: VNAVData):
-        inst.record_posix.append(rec.posix)
-        inst.record_dnum.append(rec.dnum)
-        inst.raw_payloads.append(rec.payload)
-
-        payload = rec.payload
-        n = len(payload)
-        i = 0
-
-        while i + 16 + 1 <= n:
-            ts_bytes = payload[i: i + 16]
-            try:
-                ts_ms = int(ts_bytes.decode("ascii", errors="ignore"), 16)
-            except ValueError:
-                i += 1
-                continue
-
-            tag_pos = i + 16
-            if tag_pos >= n or payload[tag_pos] != ord("$"):
-                i += 1
-                continue
-
-            star_idx = payload.find(b"*", tag_pos)
-            if star_idx == -1 or star_idx + 2 > n:
-                break
-
-            body_for_cksum = payload[tag_pos + 1: star_idx]
-            computed_cksum = 0
-            for b in body_for_cksum:
-                computed_cksum ^= b
-            computed_cksum &= 0xFF
-
-            cksum_bytes = payload[star_idx + 1: star_idx + 3]
-            try:
-                published_cksum = int(cksum_bytes.decode("ascii", errors="ignore"), 16)
-            except ValueError:
-                i = star_idx + 3
-                continue
-
-            if computed_cksum != published_cksum:
-                print(
-                    f"[VNAV] BAD sample checksum (computed=0x{computed_cksum:02X}, published=0x{published_cksum:02X})")
-
-            msg_bytes = payload[tag_pos: star_idx]
-            msg_str = msg_bytes.decode("ascii", errors="ignore")
-            fields = msg_str.split(",")
-            if len(fields) < 10:
-                i = star_idx + 3
-                continue
-
-            try:
-                magx = float(fields[1])
-                magy = float(fields[2])
-                magz = float(fields[3])
-                accelx = float(fields[4])
-                accely = float(fields[5])
-                accelz = float(fields[6])
-                gyrox = float(fields[7])
-                gyroy = float(fields[8])
-                gyroz = float(fields[9])
-            except ValueError:
-                i = star_idx + 3
-                continue
-
-            sample_posix = ts_ms / 1000.0
-            sample_dnum = posix_to_matlab_dnum(sample_posix)
-            inst.sample_posix.append(sample_posix)
-            inst.sample_dnum.append(sample_dnum)
-
-            inst.mag_x.append(magx);
-            inst.mag_y.append(magy);
-            inst.mag_z.append(magz)
-            inst.accel_x.append(accelx)
-            inst.accel_y.append(accely)
-            inst.accel_z.append(accelz)
-            inst.gyro_x.append(gyrox)
-            inst.gyro_y.append(gyroy)
-            inst.gyro_z.append(gyroz)
-
-            i = star_idx + 3
-            while i < n and payload[i] in (0x0D, 0x0A):
-                i += 1
-
-    def _parse_ecop_record(self, rec: Record, inst: ECOPData):
-        inst.record_posix.append(rec.posix)
-        inst.record_dnum.append(rec.dnum)
-        inst.raw_payloads.append(rec.payload)
-
-    def _parse_som3_record(self, rec: Record, inst: SOM3Data):
-        inst.record_posix.append(rec.posix)
-        inst.record_dnum.append(rec.dnum)
-        inst.raw_payloads.append(rec.payload)
-
-
-class ProcessedProcessorThread(threading.Thread):
-    """
-    Consumes already-parsed instrument data structures (inst) and computes
-    processed products incrementally (no re-parsing of raw records).
-
-    For now:
-      - processed TTV: Beam1 velocity from inst.dtof, inst.tof_up, inst.tof_down
-
-    Queue messages:
-      (tag: str, inst: BaseInstrumentData)  e.g. ("TTV1", TTVData())
-    """
-
-    def __init__(self, in_queue: queue.Queue, stop_event: threading.Event):
-        super().__init__(daemon=True)
-        self.in_queue = in_queue
-        self.stop_event = stop_event
-
-        self.proc: Dict[str, BaseInstrumentData] = {
-            "TTV": ProcessedTTVData(),  # combined output (all TTV1/2/3)
-            "EFE": ProcessedEFEData(),
-            "VNAV": ProcessedVNAVData(),
-        }
-
-        # constants
-        self.theta_deg = 90.0 - TTV_ANGLE2VERTICAL
-        self.cos_theta = float(np.cos(np.deg2rad(self.theta_deg)))
-        self.sin_theta = float(np.sin(np.deg2rad(self.theta_deg)))
-
-        # keep track of where we last processed each incoming inst tag
-        self._last_idx: Dict[str, int] = {}
-
-    def run(self):
-        while not self.stop_event.is_set():
-            item = self.in_queue.get()
-            if item is None:
-                break
-            try:
-                tag, inst = item
-            except Exception:
-                continue
-
-            if tag in ("TTV1", "TTV2", "TTV3") and isinstance(inst, TTVData):
-                self._process_ttv_inst(tag, inst, self.proc["TTV"])
-            elif tag == "EFE4" and isinstance(inst, EFE4Data):
-                self._process_efe4_inst(tag, inst, self.proc["EFE"])
-            elif tag == "VNAV" and isinstance(inst, VNAVData):
-                self._process_vnav_inst(tag, inst, self.proc["VNAV"])
-
-    def _process_ttv_inst(self, tag: str, inst: TTVData, out: ProcessedTTVData):
-        """
-        Incrementally consume new samples from inst (already parsed):
-          inst.sample_posix, inst.sample_dnum, inst.tof_up, inst.tof_down, inst.dtof
-        Compute:
-          v = (L/2) * dtof / (tof_up * tof_down)
-          vcos = v * cos(theta)
-        Append into out.* lists.
-        """
-
-        # Determine how many samples are currently available (use timestamps as truth)
-        n = len(inst.sample_posix)
-        if n < 1:
-            return
-
-        # Find starting index for new samples for this tag
-        i0 = self._last_idx.get(tag, 0)
-        if i0 >= n:
-            return
-
-        # Defensive: ensure channel lists are at least length n
-        # (they should be, if your parser always appends all fields together)
-        if not (len(inst.sample_dnum) >= n and len(inst.tof_up) >= n and len(inst.tof_down) >= n and len(
-                inst.dtof) >= n):
-            # If there is a mismatch, only process up to the minimum safe length
-            n_safe = min(len(inst.sample_posix), len(inst.sample_dnum),
-                         len(inst.tof_up), len(inst.tof_down), len(inst.dtof))
-            if i0 >= n_safe:
-                return
-            n = n_safe
-
-        # Append record timestamps optionally (if you want)
-        # out.record_posix.extend(inst.record_posix)  # usually not needed here
-        # out.record_dnum.extend(inst.record_dnum)
-
-        # Process only new samples [i0:n)
-        for i in range(i0, n):
-            out.sample_posix.append(inst.sample_posix[i])
-            out.sample_dnum.append(inst.sample_dnum[i])
-            if tag == "TTV1":
-                out.X1vel.append(float(inst.beam_vel[i] * self.sin_theta))
-                out.Z1vel.append(float(inst.beam_vel[i] * self.cos_theta))
-                out.beam1.append(inst.beam_vel[i])
-
-            elif tag == "TTV2":
-                out.X2vel.append(float(inst.beam_vel[i] * self.sin_theta))
-                out.Z2vel.append(float(inst.beam_vel[i] * self.cos_theta))
-                out.beam2.append(inst.beam_vel[i])
-            elif tag == "TTV3":
-                out.X3vel.append(float(inst.beam_vel[i] * self.sin_theta))
-                out.Z3vel.append(float(inst.beam_vel[i] * self.cos_theta))
-                out.beam3.append(inst.beam_vel[i])
-
-        # Update last processed index for this tag
-        self._last_idx[tag] = n
-
-    def _process_efe4_inst(self, tag: str, inst: EFE4Data, out: ProcessedEFEData):
-        """Placeholder for EFE processing."""
-        pass
-
-    def _process_vnav_inst(self, tag: str, inst: VNAVData, out: ProcessedVNAVData):
-        """Placeholder for VNAV processing."""
-        pass
-
-
-# ----------------------------------------------------------------------
+# =============================================================================
 # Parser: state machine
-# ----------------------------------------------------------------------
+# =============================================================================
 class EpsiStateMachineParser:
     """
     $TAG tttttttttttttttt AAAAAAAA *CC <payload> *PP
     """
-
     STATE_SYNC = 0
     STATE_TAG = 1
     STATE_HEADER = 2
     STATE_PAYLOAD = 3
 
-    HEADER_LEN = 1 + 4 + 16 + 8 + 1 + 2
+    HEADER_LEN = 1 + 4 + 16 + 8 + 1 + 2  # "$" + TAG + ts16 + size8 + "*" + cc2
 
     def __init__(self, record_queue: queue.Queue):
         self.buffer = bytearray()
@@ -841,7 +642,8 @@ class EpsiStateMachineParser:
             self.state = self.STATE_PAYLOAD
         else:
             print(
-                f"[HEADER] tag={tag_str} BAD checksum (computed=0x{computed_cksum:02X}, published=0x{published_cksum:02X}), header={header!r}")
+                f"[HEADER] tag={tag_str} BAD checksum (computed=0x{computed_cksum:02X}, published=0x{published_cksum:02X})"
+            )
             del self.buffer[0]
             self.state = self.STATE_SYNC
 
@@ -852,7 +654,7 @@ class EpsiStateMachineParser:
             self.state = self.STATE_SYNC
             return True
 
-        needed = self.current_payload_size + 1 + 2
+        needed = self.current_payload_size + 1 + 2  # payload + "*" + 2 hex
         if len(self.buffer) < needed:
             return False
 
@@ -863,7 +665,7 @@ class EpsiStateMachineParser:
         tag_str = self.current_tag.decode("ascii")
 
         if star_byte != ord("*"):
-            print(f"[PAYLOAD] tag={tag_str} malformed payload (no '*'): {self.buffer[:needed]!r}")
+            print(f"[PAYLOAD] tag={tag_str} malformed payload (no '*')")
             del self.buffer[0]
             self._reset_current()
             self.state = self.STATE_SYNC
@@ -894,6 +696,8 @@ class EpsiStateMachineParser:
                 payload=bytes(payload),
             )
             self.record_queue.put(rec)
+        else:
+            print(f"[PAYLOAD] tag={tag_str} BAD payload checksum")
 
         del self.buffer[:needed]
         self._reset_current()
@@ -906,17 +710,11 @@ class EpsiStateMachineParser:
         self.current_payload_size = None
 
 
-# ----------------------------------------------------------------------
-# Parser thread (consumes byte_queue, feeds state machine)
-# ----------------------------------------------------------------------
+# =============================================================================
+# Parser thread
+# =============================================================================
 class ParserThread(threading.Thread):
-    def __init__(
-            self,
-            byte_queue: queue.Queue,
-            parser: EpsiStateMachineParser,
-            record_queue: queue.Queue,
-            stop_event: threading.Event,
-    ):
+    def __init__(self, byte_queue: queue.Queue, parser: EpsiStateMachineParser, record_queue: queue.Queue, stop_event: threading.Event):
         super().__init__(daemon=True)
         self.byte_queue = byte_queue
         self.parser = parser
@@ -932,9 +730,329 @@ class ParserThread(threading.Thread):
         self.record_queue.put(None)
 
 
-# ----------------------------------------------------------------------
+# =============================================================================
+# Record processing
+# =============================================================================
+class RecordProcessorThread(threading.Thread):
+    def __init__(self, in_queue: queue.Queue, stop_event: threading.Event):
+        super().__init__(daemon=True)
+        self.in_queue = in_queue
+        self.stop_event = stop_event
+
+        self.instruments: Dict[str, BaseInstrumentData] = {
+            "DCAL": DCALData(),
+            "EFE4": EFE4Data(),
+            "TTV1": TTVData(),
+            "TTV2": TTVData(),
+            "TTV3": TTVData(),
+            "SB49": SB49Data(),
+            "SB41": SB41Data(),
+            "VNAV": VNAVData(),
+            "ECOP": ECOPData(),
+            "SOM3": SOM3Data(),
+        }
+
+        # latest DCAL parsed (used for SB49 conversion)
+        self.sb49_cal: Optional[SBE49Cal] = None
+
+    def run(self):
+        while not self.stop_event.is_set():
+            rec = self.in_queue.get()
+            if rec is None:
+                break
+            self._process_record(rec)
+
+    def _process_record(self, rec: Record):
+        tag = rec.inst_tag
+        if tag not in self.instruments:
+            return
+
+        if tag == "DCAL":
+            self._parse_dcal_record(rec, self.instruments["DCAL"])  # type: ignore[arg-type]
+        elif tag == "EFE4":
+            self._parse_efe4_record(rec, self.instruments["EFE4"])  # type: ignore[arg-type]
+        elif tag in ("TTV1", "TTV2", "TTV3"):
+            self._parse_ttv_record(rec, self.instruments[tag], tag)  # type: ignore[arg-type]
+        elif tag == "SB49":
+            self._parse_sb49_record(rec, self.instruments["SB49"])  # type: ignore[arg-type]
+        elif tag == "SB41":
+            self._parse_sb41_record(rec, self.instruments["SB41"])  # type: ignore[arg-type]
+        elif tag == "VNAV":
+            self._parse_vnav_record(rec, self.instruments["VNAV"])  # type: ignore[arg-type]
+        elif tag == "ECOP":
+            self._parse_ecop_record(rec, self.instruments["ECOP"])  # type: ignore[arg-type]
+        elif tag == "SOM3":
+            self._parse_som3_record(rec, self.instruments["SOM3"])  # type: ignore[arg-type]
+
+    # ---------------- Instrument parsers ------------------
+
+    def _parse_dcal_record(self, rec: Record, inst: DCALData):
+        inst.record_posix.append(rec.posix)
+        inst.record_dnum.append(rec.dnum)
+        txt = rec.payload.decode("ascii", errors="ignore")
+        inst.raw_text.append(txt)
+
+        cal = parse_dcal_payload(rec.payload)
+        inst.cal = cal
+        self.sb49_cal = cal
+
+        if cal.valid:
+            print(f"[DCAL] Parsed SBE49 cal: SN={cal.serial_no} (valid)")
+        else:
+            print(f"[DCAL] Parsed SBE49 cal: SN={cal.serial_no} (NOT valid?)")
+
+    def _parse_efe4_record(self, rec: Record, inst: EFE4Data):
+        inst.record_posix.append(rec.posix)
+        inst.record_dnum.append(rec.dnum)
+        inst.raw_payloads.append(rec.payload)
+
+        payload = rec.payload
+        SAMPLE_BYTES = 8 + 3 * 7
+        n_samples = len(payload) // SAMPLE_BYTES
+
+        if n_samples == 0:
+            if len(payload) > 0:
+                print(f"[EFE4] Warning: payload length {len(payload)} not a multiple of {SAMPLE_BYTES}")
+            return
+
+        for i in range(n_samples):
+            offset = i * SAMPLE_BYTES
+            sample_ts_bytes = payload[offset: offset + 8]
+            chan_bytes = payload[offset + 8: offset + SAMPLE_BYTES]
+            if len(sample_ts_bytes) != 8 or len(chan_bytes) != 3 * 7:
+                break
+
+            sample_ts_ms = int.from_bytes(sample_ts_bytes, byteorder="little", signed=False)
+            sample_posix = sample_ts_ms / 1000.0
+            sample_dnum = posix_to_matlab_dnum(sample_posix)
+            inst.sample_posix.append(sample_posix)
+            inst.sample_dnum.append(sample_dnum)
+
+            c_t1 = bytes3_to_signed_int(chan_bytes[0:3])
+            c_t2 = bytes3_to_signed_int(chan_bytes[3:6])
+            c_s1 = bytes3_to_signed_int(chan_bytes[6:9])
+            c_s2 = bytes3_to_signed_int(chan_bytes[9:12])
+            c_a1 = bytes3_to_signed_int(chan_bytes[12:15])
+            c_a2 = bytes3_to_signed_int(chan_bytes[15:18])
+            c_a3 = bytes3_to_signed_int(chan_bytes[18:21])
+
+            inst.t1.append(counts24_to_volts_unipolar(c_t1, ADC_VREF_TEMP))
+            inst.t2.append(counts24_to_volts_unipolar(c_t2, ADC_VREF_TEMP))
+            inst.s1.append(counts24_to_volts_bipolar(c_s1, ADC_VREF_SHEAR))
+            inst.s2.append(counts24_to_volts_bipolar(c_s2, ADC_VREF_SHEAR))
+            inst.a1.append(volts_to_g(counts24_to_volts_unipolar(c_a1, ADC_VREF_ACCEL)))
+            inst.a2.append(volts_to_g(counts24_to_volts_unipolar(c_a2, ADC_VREF_ACCEL)))
+            inst.a3.append(volts_to_g(counts24_to_volts_unipolar(c_a3, ADC_VREF_ACCEL)))
+
+    def _parse_ttv_record(self, rec: Record, inst: TTVData, tag: str):
+        inst.record_posix.append(rec.posix)
+        inst.record_dnum.append(rec.dnum)
+        inst.raw_payloads.append(rec.payload)
+
+        payload = rec.payload
+        PACKET_SIZE = 16 + 4 + 4 + 4 + 1 + 2 + 2 + 2  # 35 bytes
+
+        if len(payload) < PACKET_SIZE:
+            return
+
+        n_packets = len(payload) // PACKET_SIZE
+        for i in range(n_packets):
+            offset = i * PACKET_SIZE
+            chunk = payload[offset: offset + PACKET_SIZE]
+            if len(chunk) < PACKET_SIZE:
+                break
+
+            ts_hex_bytes = chunk[0:16]
+            try:
+                ts_ms = int(ts_hex_bytes.decode("ascii", errors="ignore"), 16)
+            except ValueError:
+                continue
+
+            sample_posix = ts_ms / 1000.0
+            sample_dnum = posix_to_matlab_dnum(sample_posix)
+            inst.sample_posix.append(sample_posix)
+            inst.sample_dnum.append(sample_dnum)
+
+            idx = 16
+            tof_up = struct.unpack(">f", chunk[idx:idx+4])[0]; idx += 4
+            tof_down = struct.unpack(">f", chunk[idx:idx+4])[0]; idx += 4
+            dtof = struct.unpack(">f", chunk[idx:idx+4])[0]; idx += 4
+            errorcode = chunk[idx]; idx += 1
+            upstream_adcpeak = struct.unpack(">H", chunk[idx:idx+2])[0]; idx += 2
+            downstream_adcpeak = struct.unpack(">H", chunk[idx:idx+2])[0]; idx += 2
+            # last 2 bytes are CRLF
+
+            beam_vel = (TTV_SPACE / 2.0) * dtof / (tof_up * tof_down)
+
+            inst.tof_up.append(float(tof_up))
+            inst.tof_down.append(float(tof_down))
+            inst.dtof.append(float(dtof))
+            inst.errorcode.append(int(errorcode))
+            inst.upstream_adcpeak.append(int(upstream_adcpeak))
+            inst.downstream_adcpeak.append(int(downstream_adcpeak))
+            inst.beam_vel.append(float(beam_vel))
+
+    def _parse_sb49_record(self, rec: Record, inst: SB49Data):
+        inst.record_posix.append(rec.posix)
+        inst.record_dnum.append(rec.dnum)
+        inst.raw_payloads.append(rec.payload)
+
+        cal = self.sb49_cal
+        if cal is None or not cal.valid:
+            # We can still store raw; conversion waits until DCAL arrives
+            # (but user says DCAL comes first, so normally this won't happen)
+            print("[SB49] Warning: no valid DCAL parsed yet; storing raw only.")
+            return
+
+        payload = rec.payload
+        ELEMENT_TS_LEN = 16
+        RAW_LEN = 24  # ttttttccccccppppppvvvv\r\n
+        ELEMENT_LEN = ELEMENT_TS_LEN + RAW_LEN  # 40 bytes
+
+        if len(payload) < ELEMENT_LEN:
+            return
+
+        n_el = len(payload) // ELEMENT_LEN
+        if len(payload) % ELEMENT_LEN != 0:
+            print(f"[SB49] Warning: payload not divisible by {ELEMENT_LEN}; using first {n_el} elements.")
+
+        for k in range(n_el):
+            off = k * ELEMENT_LEN
+            ts_hex = payload[off:off+16]
+            raw = payload[off+16:off+16+RAW_LEN]
+
+            try:
+                ts_ms = int(ts_hex.decode("ascii", errors="ignore"), 16)
+            except ValueError:
+                continue
+
+            # raw is ASCII hex + CRLF
+            raw_str = raw.decode("ascii", errors="ignore")
+            # Expect: 6+6+6+4+2 = 24 bytes, last two are \r\n
+            core = raw_str[:22]  # strip CRLF (2 chars)
+            if len(core) < 22:
+                continue
+
+            try:
+                T_raw = int(core[0:6], 16)
+                C_raw = int(core[6:12], 16)
+                P_raw = int(core[12:18], 16)
+                PT_raw = int(core[18:22], 16)
+            except ValueError:
+                continue
+
+            sample_posix = ts_ms / 1000.0
+            sample_dnum = posix_to_matlab_dnum(sample_posix)
+
+            inst.sample_posix.append(sample_posix)
+            inst.sample_dnum.append(sample_dnum)
+
+            inst.T_raw.append(T_raw)
+            inst.C_raw.append(C_raw)
+            inst.P_raw.append(P_raw)
+            inst.PT_raw.append(PT_raw)
+
+            # Convert to physical
+            T_C = sbe49_raw_to_temperature(T_raw, cal)
+            P_dbar = sbe49_raw_to_pressure(P_raw, PT_raw, cal)
+            C_Sm = sbe49_raw_to_conductivity(C_raw, T_C, P_dbar, cal)
+            S_psu = salinity_from_conductivity_simple(C_Sm, T_C, P_dbar)
+
+            inst.T.append(float(T_C))
+            inst.P.append(float(P_dbar))
+            inst.C.append(float(C_Sm))
+            inst.S.append(float(S_psu))
+
+    def _parse_sb41_record(self, rec: Record, inst: SB41Data):
+        inst.record_posix.append(rec.posix)
+        inst.record_dnum.append(rec.dnum)
+        inst.raw_payloads.append(rec.payload)
+
+    def _parse_vnav_record(self, rec: Record, inst: VNAVData):
+        inst.record_posix.append(rec.posix)
+        inst.record_dnum.append(rec.dnum)
+        inst.raw_payloads.append(rec.payload)
+
+        payload = rec.payload
+        n = len(payload)
+        i = 0
+
+        while i + 16 + 1 <= n:
+            ts_bytes = payload[i:i+16]
+            try:
+                ts_ms = int(ts_bytes.decode("ascii", errors="ignore"), 16)
+            except ValueError:
+                i += 1
+                continue
+
+            tag_pos = i + 16
+            if tag_pos >= n or payload[tag_pos] != ord("$"):
+                i += 1
+                continue
+
+            star_idx = payload.find(b"*", tag_pos)
+            if star_idx == -1 or star_idx + 2 > n:
+                break
+
+            body_for_cksum = payload[tag_pos + 1: star_idx]
+            computed_cksum = 0
+            for b in body_for_cksum:
+                computed_cksum ^= b
+            computed_cksum &= 0xFF
+
+            cksum_bytes = payload[star_idx + 1: star_idx + 3]
+            try:
+                published_cksum = int(cksum_bytes.decode("ascii", errors="ignore"), 16)
+            except ValueError:
+                i = star_idx + 3
+                continue
+
+            if computed_cksum != published_cksum:
+                # still try to parse
+                pass
+
+            msg_bytes = payload[tag_pos: star_idx]
+            msg_str = msg_bytes.decode("ascii", errors="ignore")
+            fields = msg_str.split(",")
+            if len(fields) < 10:
+                i = star_idx + 3
+                continue
+
+            try:
+                magx = float(fields[1]); magy = float(fields[2]); magz = float(fields[3])
+                accelx = float(fields[4]); accely = float(fields[5]); accelz = float(fields[6])
+                gyrox = float(fields[7]); gyroy = float(fields[8]); gyroz = float(fields[9])
+            except ValueError:
+                i = star_idx + 3
+                continue
+
+            sample_posix = ts_ms / 1000.0
+            sample_dnum = posix_to_matlab_dnum(sample_posix)
+            inst.sample_posix.append(sample_posix)
+            inst.sample_dnum.append(sample_dnum)
+
+            inst.mag_x.append(magx); inst.mag_y.append(magy); inst.mag_z.append(magz)
+            inst.accel_x.append(accelx); inst.accel_y.append(accely); inst.accel_z.append(accelz)
+            inst.gyro_x.append(gyrox); inst.gyro_y.append(gyroy); inst.gyro_z.append(gyroz)
+
+            i = star_idx + 3
+            while i < n and payload[i] in (0x0D, 0x0A):
+                i += 1
+
+    def _parse_ecop_record(self, rec: Record, inst: ECOPData):
+        inst.record_posix.append(rec.posix)
+        inst.record_dnum.append(rec.dnum)
+        inst.raw_payloads.append(rec.payload)
+
+    def _parse_som3_record(self, rec: Record, inst: SOM3Data):
+        inst.record_posix.append(rec.posix)
+        inst.record_dnum.append(rec.dnum)
+        inst.raw_payloads.append(rec.payload)
+
+
+# =============================================================================
 # GUI helpers
-# ----------------------------------------------------------------------
+# =============================================================================
 def _psd_from_timeseries(t: np.ndarray, y: np.ndarray):
     if t.size < 8:
         return None, None
@@ -954,30 +1072,15 @@ def _psd_from_timeseries(t: np.ndarray, y: np.ndarray):
     return f, psd
 
 
-# NOTE: your window classes (EFE4Window/TTVWindow/VNAVWindow/InstrumentWindowManager)
-# are unchanged from what you pasted (keep them as-is).
-# To keep this message focused on TCP + quit/stop, I’m not duplicating them again.
-#
-# Paste your existing window classes below this line unchanged.
-# ----------------------------------------------------------------------
-
+# =============================================================================
+# Windows (EFE4, TTV, VNAV are same style as your previous version)
+# =============================================================================
 class EFE4Window(QtWidgets.QMainWindow):
-    """
-    EFE4 window:
-      Left:
-        - t1,t2
-        - s1,s2
-        - a1,a2,a3
-      Right:
-        - Spectra of all 7 channels in one subplot + 24/20/16-bit noise floors.
-    """
-
     def __init__(self, inst_data: EFE4Data, use_full_series: bool):
         super().__init__()
         self.inst_data = inst_data
         self.use_full_series = use_full_series
-        self.window_seconds = 5.0  # used only if not full series
-
+        self.window_seconds = 5.0
         self.setWindowTitle("EFE4 – realtime")
 
         central = QtWidgets.QWidget()
@@ -991,7 +1094,6 @@ class EFE4Window(QtWidgets.QMainWindow):
 
         self.ts_curves: Dict[str, pg.PlotDataItem] = {}
 
-        # 1) t1 & t2
         p_t = pg.PlotWidget()
         p_t.setLabel("left", "T (V)")
         p_t.setLabel("bottom", "time", "s")
@@ -1000,7 +1102,6 @@ class EFE4Window(QtWidgets.QMainWindow):
         p_t.addLegend()
         left_layout.addWidget(p_t)
 
-        # 2) s1 & s2
         p_s = pg.PlotWidget()
         p_s.setLabel("left", "Shear (V)")
         p_s.setLabel("bottom", "time", "s")
@@ -1009,7 +1110,6 @@ class EFE4Window(QtWidgets.QMainWindow):
         p_s.addLegend()
         left_layout.addWidget(p_s)
 
-        # 3) a1,a2,a3
         p_a = pg.PlotWidget()
         p_a.setLabel("left", "Accel (g)")
         p_a.setLabel("bottom", "time", "s")
@@ -1019,7 +1119,6 @@ class EFE4Window(QtWidgets.QMainWindow):
         p_a.addLegend()
         left_layout.addWidget(p_a)
 
-        # Spectral plot (single subplot)
         self.sp_widget = pg.PlotWidget()
         self.sp_widget.setLabel("left", "PSD")
         self.sp_widget.setLabel("bottom", "f", "Hz")
@@ -1029,17 +1128,7 @@ class EFE4Window(QtWidgets.QMainWindow):
 
         self.sp_curves: Dict[str, pg.PlotDataItem] = {}
         for ch in ["t1", "t2", "s1", "s2", "a1", "a2", "a3"]:
-            self.sp_curves[ch] = self.sp_widget.plot(
-                [], [], pen=pg.mkPen(EFE4_COLORS[ch]), name=ch
-            )
-
-        # Noise floors
-        pen24 = pg.mkPen((150, 150, 150), style=QtCore.Qt.DashLine)
-        pen20 = pg.mkPen((200, 100, 100), style=QtCore.Qt.DashLine)
-        pen16 = pg.mkPen((100, 200, 100), style=QtCore.Qt.DashLine)
-        self.noise24 = self.sp_widget.plot([], [], pen=pen24, name="24-bit NF")
-        self.noise20 = self.sp_widget.plot([], [], pen=pen20, name="20-bit NF")
-        self.noise16 = self.sp_widget.plot([], [], pen=pen16, name="16-bit NF")
+            self.sp_curves[ch] = self.sp_widget.plot([], [], pen=pg.mkPen(EFE4_COLORS[ch]), name=ch)
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.update_plots)
@@ -1050,21 +1139,18 @@ class EFE4Window(QtWidgets.QMainWindow):
             return
 
         t = np.asarray(self.inst_data.sample_posix, dtype=float)
-        N = t.size
-        if N < 2:
+        if t.size < 2:
             return
 
         if self.use_full_series:
             mask = np.ones_like(t, dtype=bool)
         else:
-            t0 = t[-1] - self.window_seconds
-            mask = t >= t0
+            mask = t >= (t[-1] - self.window_seconds)
 
         if mask.sum() < 8:
             return
 
         t_w = t[mask]
-
         if self.use_full_series and t_w.size > 10000:
             step = t_w.size // 10000 + 1
             dec = np.zeros_like(mask, dtype=bool)
@@ -1074,69 +1160,37 @@ class EFE4Window(QtWidgets.QMainWindow):
             t_w = t[mask]
 
         t_rel = t_w - t_w[0]
-        f_sample = None
-
-        def _update_channel(ch_name):
-            nonlocal f_sample
-            if not hasattr(self.inst_data, ch_name):
-                return None, None
-            y_all = np.asarray(getattr(self.inst_data, ch_name), dtype=float)
-            if y_all.size != t.size:
-                return None, None
-            y = y_all[mask]
-            if y.size < 8:
-                return None, None
-            self.ts_curves[ch_name].setData(t_rel, y)
-            f, psd = _psd_from_timeseries(t_w, y)
-            if f is None:
-                return None, None
-            self.sp_curves[ch_name].setData(f, psd)
-            f_sample = f
-            return f, psd
 
         for ch in ["t1", "t2", "s1", "s2", "a1", "a2", "a3"]:
-            _update_channel(ch)
-
-        if f_sample is not None and f_sample.size > 0:
-            f = f_sample
-            nf24 = 1e-12 * np.ones_like(f)
-            nf20 = 1e-10 * np.ones_like(f)
-            nf16 = 1e-8 * np.ones_like(f)
-            self.noise24.setData(f, nf24)
-            self.noise20.setData(f, nf20)
-            self.noise16.setData(f, nf16)
+            y_all = np.asarray(getattr(self.inst_data, ch), dtype=float)
+            if y_all.size != t.size:
+                continue
+            y = y_all[mask]
+            if y.size < 8:
+                continue
+            self.ts_curves[ch].setData(t_rel, y)
+            f, psd = _psd_from_timeseries(t_w, y)
+            if f is not None:
+                self.sp_curves[ch].setData(f, psd)
 
 
 class TTVWindow(QtWidgets.QMainWindow):
-    """
-    TTV window: combines TTV1, TTV2, TTV3.
-    """
-
     def __init__(self, ttv_dict: Dict[str, TTVData], use_full_series: bool):
         super().__init__()
         self.ttv_dict = ttv_dict
         self.use_full_series = use_full_series
         self.window_seconds = 5.0
-
         self.setWindowTitle("TTV1/TTV2/TTV3 – realtime")
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QHBoxLayout(central)
-
         left_layout = QtWidgets.QVBoxLayout()
         right_layout = QtWidgets.QVBoxLayout()
         layout.addLayout(left_layout, 1)
         layout.addLayout(right_layout, 1)
 
-        ch_groups = [
-            "tof_down",
-            "tof_up",
-            "dtof",
-            "errorcode",
-            "upstream_adcpeak",
-            "downstream_adcpeak",
-        ]
+        ch_groups = ["tof_down", "tof_up", "dtof", "errorcode", "upstream_adcpeak", "downstream_adcpeak", "beam_vel"]
 
         self.ts_plots: Dict[str, pg.PlotWidget] = {}
         self.ts_curves: Dict[str, Dict[str, pg.PlotDataItem]] = {}
@@ -1151,8 +1205,7 @@ class TTVWindow(QtWidgets.QMainWindow):
             for tag in ("TTV1", "TTV2", "TTV3"):
                 if tag in self.ttv_dict:
                     color = TTV_TAG_COLORS.get(tag, (255, 255, 255))
-                    curve = p.plot([], [], pen=pg.mkPen(color), name=tag)
-                    self.ts_curves[ch][tag] = curve
+                    self.ts_curves[ch][tag] = p.plot([], [], pen=pg.mkPen(color), name=tag)
             left_layout.addWidget(p)
 
         self.sp_widget = pg.PlotWidget()
@@ -1162,15 +1215,12 @@ class TTVWindow(QtWidgets.QMainWindow):
         self.sp_widget.addLegend()
         right_layout.addWidget(self.sp_widget)
 
-        self.sp_curves: Dict[tuple, pg.PlotDataItem] = {}
+        self.sp_curves: Dict[Tuple[str, str], pg.PlotDataItem] = {}
         for ch in ch_groups:
             for tag in ("TTV1", "TTV2", "TTV3"):
                 if tag in self.ttv_dict:
-                    name = f"{tag}-{ch}"
                     color = TTV_TAG_COLORS.get(tag, (255, 255, 255))
-                    self.sp_curves[(tag, ch)] = self.sp_widget.plot(
-                        [], [], pen=pg.mkPen(color), name=name
-                    )
+                    self.sp_curves[(tag, ch)] = self.sp_widget.plot([], [], pen=pg.mkPen(color), name=f"{tag}-{ch}")
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.update_plots)
@@ -1178,34 +1228,24 @@ class TTVWindow(QtWidgets.QMainWindow):
 
     def update_plots(self):
         latest = None
-        for tag, inst in self.ttv_dict.items():
+        for inst in self.ttv_dict.values():
             if inst.sample_posix:
-                if latest is None or inst.sample_posix[-1] > latest:
-                    latest = inst.sample_posix[-1]
-
+                latest = inst.sample_posix[-1] if latest is None else max(latest, inst.sample_posix[-1])
         if latest is None:
             return
 
         for tag, inst in self.ttv_dict.items():
-            if not inst.sample_posix:
-                continue
-
             t = np.asarray(inst.sample_posix, dtype=float)
-            N = t.size
-            if N < 2:
+            if t.size < 2:
                 continue
-
             if self.use_full_series:
                 mask = np.ones_like(t, dtype=bool)
             else:
-                t0 = latest - self.window_seconds
-                mask = t >= t0
-
+                mask = t >= (latest - self.window_seconds)
             if mask.sum() < 8:
                 continue
 
             t_w = t[mask]
-
             if self.use_full_series and t_w.size > 10000:
                 step = t_w.size // 10000 + 1
                 dec = np.zeros_like(mask, dtype=bool)
@@ -1213,61 +1253,32 @@ class TTVWindow(QtWidgets.QMainWindow):
                 dec[idxs] = True
                 mask = dec
                 t_w = t[mask]
-
             t_rel = t_w - t_w[0]
 
-            def _plot_ts_and_psd(ch_name: str):
-                if not hasattr(inst, ch_name):
-                    return
-                y_all = np.asarray(getattr(inst, ch_name), dtype=float)
+            for ch in ["tof_down", "tof_up", "dtof", "errorcode", "upstream_adcpeak", "downstream_adcpeak", "beam_vel"]:
+                y_all = np.asarray(getattr(inst, ch), dtype=float)
                 if y_all.size != t.size:
-                    return
+                    continue
                 y = y_all[mask]
                 if y.size < 8:
-                    return
-                if ch_name in self.ts_curves and tag in self.ts_curves[ch_name]:
-                    self.ts_curves[ch_name][tag].setData(t_rel, y)
+                    continue
+                self.ts_curves[ch][tag].setData(t_rel, y)
                 f, psd = _psd_from_timeseries(t_w, y)
-                if f is None:
-                    return
-                key = (tag, ch_name)
-                if key in self.sp_curves:
-                    self.sp_curves[key].setData(f, psd)
-
-            for ch in [
-                "tof_down",
-                "tof_up",
-                "dtof",
-                "errorcode",
-                "upstream_adcpeak",
-                "downstream_adcpeak",
-            ]:
-                _plot_ts_and_psd(ch)
+                if f is not None:
+                    self.sp_curves[(tag, ch)].setData(f, psd)
 
 
 class VNAVWindow(QtWidgets.QMainWindow):
-    """
-    VNAV window:
-      Left:
-        - mag_x, mag_y, mag_z
-        - accel_x, accel_y, accel_z
-        - gyro_x, gyro_y, gyro_z
-      Right:
-        - spectral plot for all 9 channels
-    """
-
     def __init__(self, inst_data: VNAVData, use_full_series: bool):
         super().__init__()
         self.inst_data = inst_data
         self.use_full_series = use_full_series
         self.window_seconds = 5.0
-
         self.setWindowTitle("VNAV – realtime")
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         layout = QtWidgets.QHBoxLayout(central)
-
         left_layout = QtWidgets.QVBoxLayout()
         right_layout = QtWidgets.QVBoxLayout()
         layout.addLayout(left_layout, 1)
@@ -1275,34 +1286,21 @@ class VNAVWindow(QtWidgets.QMainWindow):
 
         self.ts_curves: Dict[str, pg.PlotDataItem] = {}
 
-        # Mags
-        p_mag = pg.PlotWidget()
-        p_mag.setLabel("left", "Mag")
-        p_mag.setLabel("bottom", "time", "s")
-        p_mag.addLegend()
+        p_mag = pg.PlotWidget(); p_mag.setLabel("left", "Mag"); p_mag.setLabel("bottom", "time", "s"); p_mag.addLegend()
         for ch in ["mag_x", "mag_y", "mag_z"]:
             self.ts_curves[ch] = p_mag.plot([], [], pen=pg.mkPen(VNAV_COLORS[ch]), name=ch)
         left_layout.addWidget(p_mag)
 
-        # Accels
-        p_acc = pg.PlotWidget()
-        p_acc.setLabel("left", "Accel")
-        p_acc.setLabel("bottom", "time", "s")
-        p_acc.addLegend()
+        p_acc = pg.PlotWidget(); p_acc.setLabel("left", "Accel"); p_acc.setLabel("bottom", "time", "s"); p_acc.addLegend()
         for ch in ["accel_x", "accel_y", "accel_z"]:
             self.ts_curves[ch] = p_acc.plot([], [], pen=pg.mkPen(VNAV_COLORS[ch]), name=ch)
         left_layout.addWidget(p_acc)
 
-        # Gyros
-        p_gyr = pg.PlotWidget()
-        p_gyr.setLabel("left", "Gyro")
-        p_gyr.setLabel("bottom", "time", "s")
-        p_gyr.addLegend()
+        p_gyr = pg.PlotWidget(); p_gyr.setLabel("left", "Gyro"); p_gyr.setLabel("bottom", "time", "s"); p_gyr.addLegend()
         for ch in ["gyro_x", "gyro_y", "gyro_z"]:
             self.ts_curves[ch] = p_gyr.plot([], [], pen=pg.mkPen(VNAV_COLORS[ch]), name=ch)
         left_layout.addWidget(p_gyr)
 
-        # Spectral plot (single)
         self.sp_widget = pg.PlotWidget()
         self.sp_widget.setLabel("left", "PSD")
         self.sp_widget.setLabel("bottom", "f", "Hz")
@@ -1311,39 +1309,26 @@ class VNAVWindow(QtWidgets.QMainWindow):
         right_layout.addWidget(self.sp_widget)
 
         self.sp_curves: Dict[str, pg.PlotDataItem] = {}
-        for ch in [
-            "mag_x", "mag_y", "mag_z",
-            "accel_x", "accel_y", "accel_z",
-            "gyro_x", "gyro_y", "gyro_z",
-        ]:
-            self.sp_curves[ch] = self.sp_widget.plot(
-                [], [], pen=pg.mkPen(VNAV_COLORS[ch]), name=ch
-            )
+        for ch in ["mag_x","mag_y","mag_z","accel_x","accel_y","accel_z","gyro_x","gyro_y","gyro_z"]:
+            self.sp_curves[ch] = self.sp_widget.plot([], [], pen=pg.mkPen(VNAV_COLORS[ch]), name=ch)
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.update_plots)
         self.timer.start(150)
 
     def update_plots(self):
-        if not self.inst_data.sample_posix:
-            return
-
         t = np.asarray(self.inst_data.sample_posix, dtype=float)
-        N = t.size
-        if N < 2:
+        if t.size < 2:
             return
 
         if self.use_full_series:
             mask = np.ones_like(t, dtype=bool)
         else:
-            t0 = t[-1] - self.window_seconds
-            mask = t >= t0
-
+            mask = t >= (t[-1] - self.window_seconds)
         if mask.sum() < 8:
             return
 
         t_w = t[mask]
-
         if self.use_full_series and t_w.size > 10000:
             step = t_w.size // 10000 + 1
             dec = np.zeros_like(mask, dtype=bool)
@@ -1354,98 +1339,109 @@ class VNAVWindow(QtWidgets.QMainWindow):
 
         t_rel = t_w - t_w[0]
 
-        for ch in [
-            "mag_x", "mag_y", "mag_z",
-            "accel_x", "accel_y", "accel_z",
-            "gyro_x", "gyro_y", "gyro_z",
-        ]:
-            if not hasattr(self.inst_data, ch):
-                continue
+        for ch in ["mag_x","mag_y","mag_z","accel_x","accel_y","accel_z","gyro_x","gyro_y","gyro_z"]:
             y_all = np.asarray(getattr(self.inst_data, ch), dtype=float)
             if y_all.size != t.size:
                 continue
             y = y_all[mask]
             if y.size < 8:
                 continue
-
             self.ts_curves[ch].setData(t_rel, y)
             f, psd = _psd_from_timeseries(t_w, y)
-            if f is None:
-                continue
-            self.sp_curves[ch].setData(f, psd)
+            if f is not None:
+                self.sp_curves[ch].setData(f, psd)
 
 
-class TTVProcessedWindow(QtWidgets.QMainWindow):
+class SB49Window(QtWidgets.QMainWindow):
     """
-    Window for Processed TTV data (Beam Velocity).
+    Plots SB49 physical time series: T [C], P [dbar], S [psu]
+    and a spectra panel (single plot with curves).
     """
-
-    def __init__(self, processed_ttv: ProcessedTTVData, use_full_series: bool):
+    def __init__(self, inst_data: SB49Data, use_full_series: bool):
         super().__init__()
-        self.data = processed_ttv
+        self.inst_data = inst_data
         self.use_full_series = use_full_series
         self.window_seconds = 10.0
-        self.setWindowTitle("TTV Processed - Beam Velocity")
+        self.setWindowTitle("SB49 – realtime (T,P,S)")
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
-        layout = QtWidgets.QVBoxLayout(central)
+        layout = QtWidgets.QHBoxLayout(central)
+        left_layout = QtWidgets.QVBoxLayout()
+        right_layout = QtWidgets.QVBoxLayout()
+        layout.addLayout(left_layout, 1)
+        layout.addLayout(right_layout, 1)
 
-        self.plot_vel = pg.PlotWidget()
-        self.plot_vel.setLabel("left", "Velocity", "m/s")
-        self.plot_vel.setLabel("bottom", "time", "s")
-        self.plot_vel.addLegend()
-        layout.addWidget(self.plot_vel)
+        self.ts_curves: Dict[str, pg.PlotDataItem] = {}
 
-        self.curves: Dict[str, pg.PlotDataItem] = {}
-        for tag in ("TTV1", "TTV2", "TTV3"):
-            color = TTV_TAG_COLORS.get(tag, (255, 255, 255))
-            self.curves[f"{tag}_v"] = self.plot_vel.plot([], [], pen=pg.mkPen(color), name=f"{tag} Beam Vel")
-            self.curves[f"{tag}_vcos"] = self.plot_vel.plot([], [], pen=pg.mkPen(color, style=QtCore.Qt.DashLine),
-                                                            name=f"{tag} V*cos(theta)")
+        pT = pg.PlotWidget(); pT.setLabel("left","T","°C"); pT.setLabel("bottom","time","s")
+        self.ts_curves["T"] = pT.plot([], [], pen=pg.mkPen(SB49_COLORS["T"]), name="T")
+        left_layout.addWidget(pT)
+
+        pP = pg.PlotWidget(); pP.setLabel("left","P","dbar"); pP.setLabel("bottom","time","s")
+        self.ts_curves["P"] = pP.plot([], [], pen=pg.mkPen(SB49_COLORS["P"]), name="P")
+        left_layout.addWidget(pP)
+
+        pS = pg.PlotWidget(); pS.setLabel("left","S","psu"); pS.setLabel("bottom","time","s")
+        self.ts_curves["S"] = pS.plot([], [], pen=pg.mkPen(SB49_COLORS["S"]), name="S")
+        left_layout.addWidget(pS)
+
+        self.sp_widget = pg.PlotWidget()
+        self.sp_widget.setLabel("left","PSD")
+        self.sp_widget.setLabel("bottom","f","Hz")
+        self.sp_widget.setLogMode(x=True,y=True)
+        self.sp_widget.addLegend()
+        right_layout.addWidget(self.sp_widget)
+
+        self.sp_curves: Dict[str, pg.PlotDataItem] = {}
+        for ch in ["T","P","S"]:
+            self.sp_curves[ch] = self.sp_widget.plot([], [], pen=pg.mkPen(SB49_COLORS[ch]), name=ch)
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.update_plots)
         self.timer.start(200)
 
     def update_plots(self):
-        if not self.data.sample_posix:
-            return
-
-        t = np.asarray(self.data.sample_posix, dtype=float)
-        v = np.asarray(self.data.beam_vel, dtype=float)
-        vcos = np.asarray(self.data.beam_vel_cos, dtype=float)
-        tags = np.asarray(self.data.src_tag)
-
+        t = np.asarray(self.inst_data.sample_posix, dtype=float)
         if t.size < 2:
             return
 
-        latest = t[-1]
         if self.use_full_series:
-            mask_time = np.ones_like(t, dtype=bool)
+            mask = np.ones_like(t, dtype=bool)
         else:
-            mask_time = t >= (latest - self.window_seconds)
+            mask = t >= (t[-1] - self.window_seconds)
 
-        for tag in ("TTV1", "TTV2", "TTV3"):
-            mask_tag = (tags == tag)
-            mask = mask_time & mask_tag
-            if not np.any(mask):
+        if mask.sum() < 8:
+            return
+
+        t_w = t[mask]
+        if self.use_full_series and t_w.size > 20000:
+            step = t_w.size // 20000 + 1
+            dec = np.zeros_like(mask, dtype=bool)
+            idxs = np.where(mask)[0][::step]
+            dec[idxs] = True
+            mask = dec
+            t_w = t[mask]
+
+        t_rel = t_w - t_w[0]
+
+        for ch in ["T","P","S"]:
+            y_all = np.asarray(getattr(self.inst_data, ch), dtype=float)
+            if y_all.size != t.size:
                 continue
+            y = y_all[mask]
+            if y.size < 8:
+                continue
+            self.ts_curves[ch].setData(t_rel, y)
+            f, psd = _psd_from_timeseries(t_w, y)
+            if f is not None:
+                self.sp_curves[ch].setData(f, psd)
 
-            t_plot = t[mask] - t[0]
-            self.curves[f"{tag}_v"].setData(t_plot, v[mask])
-            self.curves[f"{tag}_vcos"].setData(t_plot, vcos[mask])
 
-
+# =============================================================================
+# Window manager
+# =============================================================================
 class InstrumentWindowManager(QtCore.QObject):
-    """
-    Opens one window for:
-      - EFE4
-      - TTV1/TTV2/TTV3 combined
-      - VNAV
-    as soon as there are samples.
-    """
-
     def __init__(self, record_processor: RecordProcessorThread, use_full_series: bool, parent=None):
         super().__init__(parent)
         self.record_processor = record_processor
@@ -1454,7 +1450,7 @@ class InstrumentWindowManager(QtCore.QObject):
         self.efe4_window: Optional[EFE4Window] = None
         self.ttv_window: Optional[TTVWindow] = None
         self.vnav_window: Optional[VNAVWindow] = None
-        self.ttv_proc_window: Optional[TTVProcessedWindow] = None
+        self.sb49_window: Optional[SB49Window] = None
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.check_instruments)
@@ -1463,59 +1459,40 @@ class InstrumentWindowManager(QtCore.QObject):
     @QtCore.pyqtSlot()
     def check_instruments(self):
         insts = self.record_processor.instruments
-        # Access processed data via a reference we'll need to pass or find
-        # For this implementation, we assume processed_processor.proc is accessible
-        # or we pass the processed_processor to the manager.
-        # Updated main() will pass the processed_processor.
 
-        # EFE4
         if self.efe4_window is None and "EFE4" in insts:
             efe = insts["EFE4"]
-            if efe.sample_posix:
+            if isinstance(efe, EFE4Data) and efe.sample_posix:
                 self.efe4_window = EFE4Window(efe, self.use_full_series)
                 self.efe4_window.show()
 
-        # TTV1/2/3 combined
         if self.ttv_window is None:
             ttv_dict: Dict[str, TTVData] = {}
             for tag in ("TTV1", "TTV2", "TTV3"):
-                if tag in insts and isinstance(insts[tag], TTVData) and insts[tag].sample_posix:
-                    ttv_dict[tag] = insts[tag]
+                d = insts.get(tag)
+                if isinstance(d, TTVData) and d.sample_posix:
+                    ttv_dict[tag] = d
             if ttv_dict:
                 self.ttv_window = TTVWindow(ttv_dict, self.use_full_series)
                 self.ttv_window.show()
 
-        # VNAV
         if self.vnav_window is None and "VNAV" in insts:
             vnav = insts["VNAV"]
-            if vnav.sample_posix:
+            if isinstance(vnav, VNAVData) and vnav.sample_posix:
                 self.vnav_window = VNAVWindow(vnav, self.use_full_series)
                 self.vnav_window.show()
 
-    def set_processed_processor(self, proc_thread: 'ProcessedProcessorThread'):
-        self.proc_thread = proc_thread
-
-    @QtCore.pyqtSlot()
-    def check_processed(self):
-        if not hasattr(self, 'proc_thread'):
-            return
-
-        proc_data = self.proc_thread.proc
-
-        # TTV Processed
-        if self.ttv_proc_window is None and "TTV" in proc_data:
-            ttv_p = proc_data["TTV"]
-            if ttv_p.sample_posix:
-                self.ttv_proc_window = TTVProcessedWindow(ttv_p, self.use_full_series)
-                self.ttv_proc_window.show()
-
-        # Placeholders for other processed windows
-        # if self.efe_proc_window is None and "EFE" in proc_data: ...
+        # NEW: SB49 window (requires DCAL first, but we open when samples exist)
+        if self.sb49_window is None and "SB49" in insts:
+            sb49 = insts["SB49"]
+            if isinstance(sb49, SB49Data) and sb49.sample_posix:
+                self.sb49_window = SB49Window(sb49, self.use_full_series)
+                self.sb49_window.show()
 
 
-# ----------------------------------------------------------------------
-# Quit management: allow 'q' key anywhere + Ctrl-C
-# ----------------------------------------------------------------------
+# =============================================================================
+# Quit management
+# =============================================================================
 class GlobalQuitFilter(QtCore.QObject):
     def __init__(self, on_quit_cb, parent=None):
         super().__init__(parent)
@@ -1523,27 +1500,25 @@ class GlobalQuitFilter(QtCore.QObject):
 
     def eventFilter(self, obj, event):
         if event.type() == QtCore.QEvent.KeyPress:
-            key = event.key()
-            if key == QtCore.Qt.Key_Q:
+            if event.key() == QtCore.Qt.Key_Q:
                 self.on_quit_cb()
                 return True
         return False
 
 
 def parse_tcp_arg(s: str) -> Tuple[str, int]:
-    # Accept HOST:PORT
     if ":" not in s:
         raise ValueError("TCP must be HOST:PORT")
     host, port_s = s.rsplit(":", 1)
     return host.strip(), int(port_s)
 
 
-# ----------------------------------------------------------------------
-# Main driver: set up threads + Qt app
-# ----------------------------------------------------------------------
+# =============================================================================
+# Main
+# =============================================================================
 def main():
     ap = argparse.ArgumentParser(
-        description="MOD-SOM state-machine reader/parser with realtime plots (pyqtgraph) + TCP"
+        description="MOD-SOM state-machine reader/parser with realtime plots (pyqtgraph) + TCP + SB49/DCAL"
     )
     group = ap.add_mutually_exclusive_group(required=True)
     group.add_argument("--file", "-f", help="Path to input file")
@@ -1557,13 +1532,9 @@ def main():
 
     byte_queue: queue.Queue = queue.Queue()
     record_queue: queue.Queue = queue.Queue()
-    processed_queue: queue.Queue = queue.Queue()
     stop_event = threading.Event()
 
-    processed_processor = ProcessedProcessorThread(processed_queue, stop_event)
-    processed_processor.start()
-
-    record_processor = RecordProcessorThread(record_queue, stop_event, processed_queue)
+    record_processor = RecordProcessorThread(record_queue, stop_event)
     record_processor.start()
 
     parser = EpsiStateMachineParser(record_queue)
@@ -1580,53 +1551,38 @@ def main():
     # -------- source open --------
     if args.file:
         file_obj = open(args.file, "rb")
-        source_thread = ByteSourceThread(
-            file_obj, mode="file", out_queue=byte_queue, stop_event=stop_event
-        )
+        source_thread = ByteSourceThread(file_obj, mode="file", out_queue=byte_queue, stop_event=stop_event)
         source_thread.start()
 
     elif args.serial:
         if serial is None:
             print("pyserial is not installed. Install with: pip install pyserial")
             return
-
         ser = serial.Serial(port=args.serial, baudrate=args.baud, timeout=0.1)
         source_thread = ByteSourceThread(
-            ser,
-            mode="serial",
-            out_queue=byte_queue,
-            stop_event=stop_event,
-            # keep your default start/stop behavior:
-            start_command=b"som.start\r\n",
-            stop_command=b"som.stop\r\n",
+            ser, mode="serial", out_queue=byte_queue, stop_event=stop_event,
+            start_command=b"som.start\r\n", stop_command=b"som.stop\r\n"
         )
         source_thread.start()
 
     elif args.tcp:
         host, port = parse_tcp_arg(args.tcp)
-        sock = socket.create_connection((host, port), timeout=2.0)
-        sock.settimeout(0.1)  # non-blocking-ish loop in thread
+        sock = socket.create_connection((host, port), timeout=5.0)
+        sock.settimeout(0.1)
         print(f"[Main] Connected TCP to {host}:{port}")
-        source_thread = ByteSourceThread(
-            sock, mode="tcp", out_queue=byte_queue, stop_event=stop_event
-        )
+        source_thread = ByteSourceThread(sock, mode="tcp", out_queue=byte_queue, stop_event=stop_event)
         source_thread.start()
 
-    # -------- plotting manager (unchanged) --------
+    # -------- plotting manager --------
     manager = InstrumentWindowManager(record_processor, use_full_series)
-    manager.set_processed_processor(processed_processor)
-    # Connect the check_processed to the timer or a new one
-    manager.timer.timeout.connect(manager.check_processed)
 
     # -------- unified quit path --------
     def request_quit():
-        # Safe to call multiple times
         QtCore.QTimer.singleShot(0, app.quit)
 
     def on_quit():
         stop_event.set()
 
-        # If serial, explicitly send som.stop once here too (backup exists in thread.finally)
         if ser is not None and getattr(ser, "is_open", False):
             try:
                 print("[Main] Sending som.stop to serial...")
@@ -1635,10 +1591,8 @@ def main():
             except Exception as e:
                 print(f"[Main] Warning: could not send stop command on quit: {e}")
 
-        # Unblock parser pipeline
         byte_queue.put(None)
 
-        # Join threads
         try:
             if source_thread is not None:
                 source_thread.join(timeout=1.0)
@@ -1653,45 +1607,33 @@ def main():
             record_processor.join(timeout=1.0)
         except Exception:
             pass
-        try:
-            processed_queue.put(None)
-            processed_processor.join(timeout=1.0)
-        except Exception:
-            pass
 
-        # Close resources
         if file_obj is not None:
             try:
                 file_obj.close()
             except Exception:
                 pass
-
         if ser is not None:
             try:
                 ser.close()
             except Exception:
                 pass
-
         if sock is not None:
             try:
                 sock.close()
             except Exception:
                 pass
 
-    # Press 'q' anywhere in the app
     quit_filter = GlobalQuitFilter(request_quit)
     app.installEventFilter(quit_filter)
 
-    # Ctrl-C support: schedule app.quit inside Qt event loop
     def _sigint_handler(sig, frame):
         print("\n[Main] Ctrl-C received -> quitting...")
         request_quit()
 
     signal.signal(signal.SIGINT, _sigint_handler)
-
     app.aboutToQuit.connect(on_quit)
 
-    # Small timer keeps the Qt event loop responsive to SIGINT on some platforms
     _sig_timer = QtCore.QTimer()
     _sig_timer.timeout.connect(lambda: None)
     _sig_timer.start(200)
