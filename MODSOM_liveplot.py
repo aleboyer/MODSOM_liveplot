@@ -29,6 +29,7 @@ import socket
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+import math
 
 import numpy as np
 
@@ -464,6 +465,8 @@ class ByteSourceThread(threading.Thread):
         out_queue: queue.Queue,
         stop_event: threading.Event,
         chunk_size: int = 4096,
+        dcal_command: Optional[bytes] = b"sbe.dcal\r\n",
+        dcal_command_delay_s: float = 0.05,
         start_command: Optional[bytes] = b"som.start\r\n",
         stop_command: Optional[bytes] = b"som.stop\r\n",
         start_command_delay_s: float = 0.05,
@@ -475,7 +478,9 @@ class ByteSourceThread(threading.Thread):
         self.out_queue = out_queue
         self.stop_event = stop_event
         self.chunk_size = chunk_size
+        self.dcal_command = dcal_command
         self.start_command = start_command
+        self.dcal_command_delay_s = dcal_command_delay_s
         self.stop_command = stop_command
         self.start_command_delay_s = start_command_delay_s
         self.clear_input_before_start = clear_input_before_start
@@ -496,6 +501,9 @@ class ByteSourceThread(threading.Thread):
                 try:
                     if self.clear_input_before_start and hasattr(self.source, "reset_input_buffer"):
                         self.source.reset_input_buffer()
+                    self._send_serial_cmd(self.dcal_command)
+                    if self.dcal_command_delay_s > 0:
+                        time.sleep(self.dcal_command_delay_s)
                     self._send_serial_cmd(self.start_command)
                     if self.start_command_delay_s > 0:
                         time.sleep(self.start_command_delay_s)
@@ -881,8 +889,10 @@ class RecordProcessorThread(threading.Thread):
             upstream_adcpeak = struct.unpack(">H", chunk[idx:idx+2])[0]; idx += 2
             downstream_adcpeak = struct.unpack(">H", chunk[idx:idx+2])[0]; idx += 2
             # last 2 bytes are CRLF
-
-            beam_vel = (TTV_SPACE / 2.0) * dtof / (tof_up * tof_down)
+            if tof_up <= 0 or tof_down <= 0:
+                beam_vel=0
+            else:
+                beam_vel = (TTV_SPACE / 2.0) * dtof / (tof_up * tof_down)
 
             inst.tof_up.append(float(tof_up))
             inst.tof_down.append(float(tof_down))
