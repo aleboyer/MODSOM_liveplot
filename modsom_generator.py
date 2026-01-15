@@ -3,17 +3,14 @@ import argparse
 import math
 import socket
 import struct
-import sys
 import time
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Optional, Protocol, Dict, Any
 
 try:
     import serial  # type: ignore
 except ImportError:
     serial = None
-
-
 
 
 # -----------------------------
@@ -73,7 +70,6 @@ class TCPClientWriter:
         self.sock.sendall(b)
 
     def flush(self) -> None:
-        # TCP has no flush; sendall already pushes data
         pass
 
     def close(self) -> None:
@@ -131,11 +127,8 @@ def _xor_bytes(data: bytes) -> int:
 
 def build_modsom_record(tag4: bytes, ts_ms: int, payload: bytes) -> bytes:
     """
-    Record format (as your parser expects):
+    Record format:
       $TAG + 16hex(ts_ms) + 8hex(payload_size) + *CC + payload + *PP
-
-    CC = XOR of bytes from '$' to last digit of payload_size (inclusive)
-    PP = XOR of payload bytes
     """
     if len(tag4) != 4:
         raise ValueError("tag must be exactly 4 ASCII bytes, e.g. b'EFE4'")
@@ -153,48 +146,171 @@ def build_modsom_record(tag4: bytes, ts_ms: int, payload: bytes) -> bytes:
     return header + payload + trailer
 
 
-# -----------------------------
-# Payload generators
-# -----------------------------
 def now_ms() -> int:
     return int(time.time() * 1000.0)
 
 
+# -----------------------------
+# DCAL structure + helpers
+# -----------------------------
+@dataclass
+class DCAL:
+    serial_no: str
+    temperature_date: str
+    conductivity_date: str
+    pressure_date: str
+    pressure_sn: str
+    pressure_range_psia: float
+
+    # temperature
+    TA0: float
+    TA1: float
+    TA2: float
+    TA3: float
+    TOFFSET: float
+
+    # conductivity
+    G: float
+    H: float
+    I: float
+    J: float
+    CPCOR: float
+    CTCOR: float
+    CSLOPE: float
+
+    # pressure
+    PA0: float
+    PA1: float
+    PA2: float
+    PTCA0: float
+    PTCA1: float
+    PTCA2: float
+    PTCB0: float
+    PTCB1: float
+    PTCB2: float
+    PTEMPA0: float
+    PTEMPA1: float
+    PTEMPA2: float
+    POFFSET: float
+
+
+def dcal_from_example() -> DCAL:
+    """
+    Your provided example, mapped into a structured DCAL object.
+    This is what you'll later reuse to generate $SBE records.
+    """
+    return DCAL(
+        serial_no="0131",
+        temperature_date="03-apr-22",
+        conductivity_date="03-apr-22",
+        pressure_date="01-mar-22",
+        pressure_sn="10166",
+        pressure_range_psia=1450.0,
+
+        TA0=8.021074e-04,
+        TA1=2.854267e-04,
+        TA2=-2.479661e-06,
+        TA3=2.099656e-07,
+        TOFFSET=0.0,
+
+        G=-9.984149e-01,
+        H=1.382838e-01,
+        I=-1.271138e-04,
+        J=3.163691e-05,
+        CPCOR=-9.57e-08,
+        CTCOR=3.25e-06,
+        CSLOPE=1.0,
+
+        PA0=6.234520e-01,
+        PA1=4.463881e-03,
+        PA2=1.824090e-12,
+        PTCA0=5.203688e+05,
+        PTCA1=6.073326e+00,
+        PTCA2=2.926396e-03,
+        PTCB0=2.484987e+01,
+        PTCB1=2.175000e-03,
+        PTCB2=0.0,
+        PTEMPA0=-6.100266e+01,
+        PTEMPA1=5.310386e+01,
+        PTEMPA2=-5.031106e-01,
+        POFFSET=0.0,
+    )
+
+
+def dcal_to_payload(d: DCAL) -> bytes:
+    """
+    Build the DCAL payload text (ALWAYS CRLF line endings),
+    from the structured DCAL object.
+    """
+    lines = [
+        f"  SERIAL NO. {d.serial_no}",
+        f"temperature:  {d.temperature_date}",
+        f"    TA0 = {d.TA0:.6e}",
+        f"    TA1 = {d.TA1:.6e}",
+        f"    TA2 = {d.TA2:.6e}",
+        f"    TA3 = {d.TA3:.6e}",
+        f"    TOFFSET = {d.TOFFSET:.6e}",
+        f"conductivity:  {d.conductivity_date}",
+        f"    G = {d.G:.6e}",
+        f"    H = {d.H:.6e}",
+        f"    I = {d.I:.6e}",
+        f"    J = {d.J:.6e}",
+        f"    CPCOR = {d.CPCOR:.6e}",
+        f"    CTCOR = {d.CTCOR:.6e}",
+        f"    CSLOPE = {d.CSLOPE:.6e}",
+        f"pressure S/N = {d.pressure_sn}, range = {d.pressure_range_psia:g} psia:  {d.pressure_date}",
+        f"    PA0 = {d.PA0:.6e}",
+        f"    PA1 = {d.PA1:.6e}",
+        f"    PA2 = {d.PA2:.6e}",
+        f"    PTCA0 = {d.PTCA0:.6e}",
+        f"    PTCA1 = {d.PTCA1:.6e}",
+        f"    PTCA2 = {d.PTCA2:.6e}",
+        f"    PTCB0 = {d.PTCB0:.6e}",
+        f"    PTCB1 = {d.PTCB1:.6e}",
+        f"    PTCB2 = {d.PTCB2:.6e}",
+        f"    PTEMPA0 = {d.PTEMPA0:.6e}",
+        f"    PTEMPA1 = {d.PTEMPA1:.6e}",
+        f"    PTEMPA2 = {d.PTEMPA2:.6e}",
+        f"    POFFSET = {d.POFFSET:.6e}",
+        "",  # final blank line like your example (optional)
+    ]
+    txt = "\r\n".join(lines)
+    return txt.encode("ascii", errors="strict")
+
+
+def send_dcal_record(writer: Writer, dcal: DCAL) -> None:
+    payload = dcal_to_payload(dcal)
+    ts_ms = now_ms()
+    rec = build_modsom_record(b"DCAL", ts_ms, payload)
+    writer.write(rec)
+    writer.flush()
+    print(f"[GEN] Sent DCAL: payload={len(payload)} bytes total={len(rec)} bytes ts_ms=0x{ts_ms:016x}")
+
+
+# -----------------------------
+# Payload generators (EFE4/TTV/VNAV)
+# -----------------------------
 def sine01(t: float, f_hz: float = 1.0) -> float:
-    """Sine scaled to [0,1]."""
     return 0.5 * (1.0 + math.sin(2.0 * math.pi * f_hz * t))
 
 
 def counts24_from_unit(u01: float) -> int:
-    """
-    Map u in [0,1] to a 24-bit *unsigned* range [0, 2^24-1].
-    Your parser treats the 3 bytes as unsigned currently, so we keep it simple.
-    """
     u01 = max(0.0, min(1.0, u01))
     return int(u01 * (2**24 - 1))
 
 
 def pack_u24_be(x: int) -> bytes:
-    """Pack unsigned 24-bit big-endian."""
     x = max(0, min(2**24 - 1, int(x)))
     return x.to_bytes(3, byteorder="big", signed=False)
 
 
 def make_efe4_payload(t0_posix: float, fs: float, n_samples: int) -> bytes:
-    """
-    EFE4 sample structure (binary):
-      - 8 bytes: uint64 sample_timestamp_ms (little-endian)
-      - 7 channels * 3 bytes (big-endian unsigned 24-bit)
-    Channels order: t1,t2,s1,s2,a1,a2,a3
-    """
     out = bytearray()
     for k in range(n_samples):
         t = t0_posix + k / fs
         ts_ms = int(t * 1000.0)
         out += struct.pack("<Q", ts_ms)
 
-        # 1 Hz, amplitude 1 "unit" -> we encode as [0..1] wave to get varying counts
-        # Use slight phase shifts so channels differ
         u_t1 = sine01(t, 1.0)
         u_t2 = sine01(t + 0.10, 1.0)
         u_s1 = sine01(t + 0.20, 1.0)
@@ -210,31 +326,18 @@ def make_efe4_payload(t0_posix: float, fs: float, n_samples: int) -> bytes:
 
 
 def make_ttv_payload(t0_posix: float, fs: float, n_samples: int, phase: float = 0.0) -> bytes:
-    """
-    TTV sample structure (binary) per sample:
-      16 ASCII hex timestamp_ms
-      4B tof_up float32 (big-endian)
-      4B tof_down float32 (big-endian)
-      4B dtof float32 (big-endian)
-      1B errorcode uint8
-      2B upstream_adcpeak uint16 (big-endian)
-      2B downstream_adcpeak uint16 (big-endian)
-      CRLF
-    Total = 16 + 4+4+4 +1+2+2 +2 = 35 bytes
-    """
     out = bytearray()
     for k in range(n_samples):
         t = t0_posix + k / fs
         ts_ms = int(t * 1000.0)
 
         ts_hex16 = f"{ts_ms:016x}".encode("ascii")
-        # floats vary with 1 Hz sine
         s = math.sin(2.0 * math.pi * 1.0 * (t + phase))
         tof_up = 1.0 + 0.5 * s
         tof_dn = 1.2 + 0.5 * math.sin(2.0 * math.pi * 1.0 * (t + phase + 0.2))
         dtof = tof_up - tof_dn
 
-        err = int((k % 8))  # small changing error code
+        err = int((k % 8))
         up_peak = int(1000 + 200 * (0.5 * (1 + s)))
         dn_peak = int(1100 + 200 * (0.5 * (1 + math.sin(2.0 * math.pi * 1.0 * (t + phase + 0.3)))))
 
@@ -251,20 +354,12 @@ def make_ttv_payload(t0_posix: float, fs: float, n_samples: int, phase: float = 
 
 
 def make_vnav_payload(t0_posix: float, fs: float, n_samples: int) -> bytes:
-    """
-    VNAV payload is a concatenation of ASCII samples like:
-      16hex_ts_ms + $VNMAR,<9 floats>*CS\r\n
-
-    CS = XOR of bytes between '$' and '*' (excluding both), matching your parser.
-    """
     out = bytearray()
     for k in range(n_samples):
         t = t0_posix + k / fs
         ts_ms = int(t * 1000.0)
         ts_hex16 = f"{ts_ms:016x}"
 
-        # 9 floats (mag xyz, accel xyz, gyro xyz)
-        # Use 1 Hz sine + offsets so each differs.
         magx = -0.2 + 0.5 * math.sin(2 * math.pi * 1.0 * (t + 0.00))
         magy = +0.0 + 0.5 * math.sin(2 * math.pi * 1.0 * (t + 0.10))
         magz = +0.2 + 0.5 * math.sin(2 * math.pi * 1.0 * (t + 0.20))
@@ -276,9 +371,7 @@ def make_vnav_payload(t0_posix: float, fs: float, n_samples: int) -> bytes:
         gyz = -0.0001 + 0.0002 * math.sin(2 * math.pi * 1.0 * (t + 0.80))
 
         body = f"VNMAR,{magx:+.4f},{magy:+.4f},{magz:+.4f},{accx:+.3f},{accy:+.3f},{accz:+.3f},{gyx:+.6f},{gyy:+.6f},{gyz:+.6f}"
-        # checksum XOR over bytes between '$' and '*', i.e. over "VNMAR,..."
         computed = _xor_bytes(body.encode("ascii"))
-
         line = f"{ts_hex16}${body}*{computed:02X}\r\n"
         out += line.encode("ascii")
     return bytes(out)
@@ -292,53 +385,37 @@ class GenConfig:
     duration_s: float
     chunk_s: float
     realtime: bool
-    # per instrument sample rates
     efe4_fs: float
     ttv_fs: float
     vnav_fs: float
 
 
 def run_generator(writer: Writer, cfg: GenConfig) -> None:
-    """
-    Generates mixed records interleaved over time.
-    For file mode: realtime=False -> generate as fast as possible.
-    For stream mode: realtime=True -> sleep to simulate realtime.
-    """
     t_start = time.time()
     t_end = t_start + cfg.duration_s
     next_chunk_start = t_start
 
-    # simple interleave schedule: emit one record of each tag per chunk
     while time.time() < t_end:
         chunk_start = next_chunk_start
         next_chunk_start = chunk_start + cfg.chunk_s
-
-        # use chunk_start as base time for sample timestamps
         t0_posix = chunk_start
 
-        # --- EFE4 record ---
         n_efe4 = max(1, int(round(cfg.efe4_fs * cfg.chunk_s)))
         efe4_payload = make_efe4_payload(t0_posix, cfg.efe4_fs, n_efe4)
-        rec = build_modsom_record(b"EFE4", int(t0_posix * 1000.0), efe4_payload)
-        writer.write(rec)
+        writer.write(build_modsom_record(b"EFE4", int(t0_posix * 1000.0), efe4_payload))
 
-        # --- TTV1/TTV2/TTV3 records ---
         n_ttv = max(1, int(round(cfg.ttv_fs * cfg.chunk_s)))
         for tag, ph in ((b"TTV1", 0.0), (b"TTV2", 0.2), (b"TTV3", 0.4)):
             payload = make_ttv_payload(t0_posix, cfg.ttv_fs, n_ttv, phase=ph)
-            rec = build_modsom_record(tag, int(t0_posix * 1000.0), payload)
-            writer.write(rec)
+            writer.write(build_modsom_record(tag, int(t0_posix * 1000.0), payload))
 
-        # --- VNAV record ---
         n_vnav = max(1, int(round(cfg.vnav_fs * cfg.chunk_s)))
         vnav_payload = make_vnav_payload(t0_posix, cfg.vnav_fs, n_vnav)
-        rec = build_modsom_record(b"VNAV", int(t0_posix * 1000.0), vnav_payload)
-        writer.write(rec)
+        writer.write(build_modsom_record(b"VNAV", int(t0_posix * 1000.0), vnav_payload))
 
         writer.flush()
 
         if cfg.realtime:
-            # sleep until next chunk boundary
             now = time.time()
             sleep_s = next_chunk_start - now
             if sleep_s > 0:
@@ -364,7 +441,7 @@ def main():
     out.add_argument("--file", help="Write to a raw file, e.g. modsom_0.modraw")
     out.add_argument("--serial", help="Write to a serial port, e.g. /dev/tty.usbserial-XXXX")
     out.add_argument("--tcp", help="TCP client connect host:port, e.g. 127.0.0.1:9000")
-    out.add_argument("--tcp-listen", help="TCP server listen host:port, e.g. 0.0.0.0:9000")
+    out.add_argument("--tcp-listen", dest="tcp_listen", help="TCP server listen host:port, e.g. 0.0.0.0:9000")
 
     ap.add_argument("--baud", type=int, default=115200, help="Serial baud rate (if --serial)")
 
@@ -375,6 +452,8 @@ def main():
     ap.add_argument("--efe4-fs", type=float, default=32.0, help="EFE4 sample rate (Hz)")
     ap.add_argument("--ttv-fs", type=float, default=8.0, help="TTV sample rate (Hz)")
     ap.add_argument("--vnav-fs", type=float, default=10.0, help="VNAV sample rate (Hz)")
+
+    ap.add_argument("--no-dcal", action="store_true", help="Do not send DCAL at stream start")
 
     args = ap.parse_args()
 
@@ -391,30 +470,31 @@ def main():
     try:
         if args.file:
             writer = FileWriter(args.file)
-            # file generation: typically no realtime needed (generate as fast as possible)
             if not args.realtime:
                 cfg.realtime = False
-
         elif args.serial:
             writer = SerialWriter(args.serial, args.baud)
-            # streaming defaults to realtime unless user opts out
             if not args.realtime:
                 cfg.realtime = True
-
         elif args.tcp:
             host, port = parse_hostport(args.tcp)
             writer = TCPClientWriter(host, port)
             if not args.realtime:
                 cfg.realtime = True
-
         elif args.tcp_listen:
             host, port = parse_hostport(args.tcp_listen)
             writer = TCPServerWriter(host, port)
             if not args.realtime:
                 cfg.realtime = True
-
         else:
             ap.error("No output mode selected.")
+
+        # ---- build DCAL structure once; use it for DCAL record + later $SBE ----
+        dcal = dcal_from_example()
+
+        # ---- SEND DCAL ONCE AT START ----
+        if not args.no_dcal:
+            send_dcal_record(writer, dcal)
 
         print(f"[GEN] starting: duration={cfg.duration_s}s chunk={cfg.chunk_s}s realtime={cfg.realtime}")
         print(f"[GEN] EFE4 fs={cfg.efe4_fs}Hz, TTV fs={cfg.ttv_fs}Hz, VNAV fs={cfg.vnav_fs}Hz")
