@@ -5,7 +5,8 @@ import socket
 import struct
 import time
 from dataclasses import dataclass
-from typing import Optional, Protocol, Dict, Any
+from typing import Optional, Protocol
+
 
 try:
     import serial  # type: ignore
@@ -13,9 +14,9 @@ except ImportError:
     serial = None
 
 
-# -----------------------------
+# =============================================================================
 # Writer backend (shared)
-# -----------------------------
+# =============================================================================
 class Writer(Protocol):
     def write(self, b: bytes) -> None: ...
     def flush(self) -> None: ...
@@ -115,9 +116,9 @@ class TCPServerWriter:
             pass
 
 
-# -----------------------------
+# =============================================================================
 # MODSOM framing helpers
-# -----------------------------
+# =============================================================================
 def _xor_bytes(data: bytes) -> int:
     x = 0
     for bb in data:
@@ -129,6 +130,8 @@ def build_modsom_record(tag4: bytes, ts_ms: int, payload: bytes) -> bytes:
     """
     Record format:
       $TAG + 16hex(ts_ms) + 8hex(payload_size) + *CC + payload + *PP
+    CC = XOR of bytes from '$' to last digit of payload_size (inclusive)
+    PP = XOR of payload bytes
     """
     if len(tag4) != 4:
         raise ValueError("tag must be exactly 4 ASCII bytes, e.g. b'EFE4'")
@@ -150,9 +153,9 @@ def now_ms() -> int:
     return int(time.time() * 1000.0)
 
 
-# -----------------------------
-# DCAL structure + helpers
-# -----------------------------
+# =============================================================================
+# DCAL structure (SBE49 cal) + payload generator
+# =============================================================================
 @dataclass
 class DCAL:
     serial_no: str
@@ -195,10 +198,6 @@ class DCAL:
 
 
 def dcal_from_example() -> DCAL:
-    """
-    Your provided example, mapped into a structured DCAL object.
-    This is what you'll later reuse to generate $SBE records.
-    """
     return DCAL(
         serial_no="0131",
         temperature_date="03-apr-22",
@@ -238,10 +237,7 @@ def dcal_from_example() -> DCAL:
 
 
 def dcal_to_payload(d: DCAL) -> bytes:
-    """
-    Build the DCAL payload text (ALWAYS CRLF line endings),
-    from the structured DCAL object.
-    """
+    # ALWAYS CRLF line endings
     lines = [
         f"  SERIAL NO. {d.serial_no}",
         f"temperature:  {d.temperature_date}",
@@ -272,10 +268,9 @@ def dcal_to_payload(d: DCAL) -> bytes:
         f"    PTEMPA1 = {d.PTEMPA1:.6e}",
         f"    PTEMPA2 = {d.PTEMPA2:.6e}",
         f"    POFFSET = {d.POFFSET:.6e}",
-        "",  # final blank line like your example (optional)
+        "",
     ]
-    txt = "\r\n".join(lines)
-    return txt.encode("ascii", errors="strict")
+    return ("\r\n".join(lines)).encode("ascii", errors="strict")
 
 
 def send_dcal_record(writer: Writer, dcal: DCAL) -> None:
@@ -284,12 +279,12 @@ def send_dcal_record(writer: Writer, dcal: DCAL) -> None:
     rec = build_modsom_record(b"DCAL", ts_ms, payload)
     writer.write(rec)
     writer.flush()
-    print(f"[GEN] Sent DCAL: payload={len(payload)} bytes total={len(rec)} bytes ts_ms=0x{ts_ms:016x}")
+    print(f"[GEN] Sent DCAL: payload={len(payload)} bytes total={len(rec)} bytes")
 
 
-# -----------------------------
-# Payload generators (EFE4/TTV/VNAV)
-# -----------------------------
+# =============================================================================
+# Existing synthetic payload generators (EFE4/TTV/VNAV) – unchanged
+# =============================================================================
 def sine01(t: float, f_hz: float = 1.0) -> float:
     return 0.5 * (1.0 + math.sin(2.0 * math.pi * f_hz * t))
 
@@ -321,7 +316,6 @@ def make_efe4_payload(t0_posix: float, fs: float, n_samples: int) -> bytes:
 
         for u in (u_t1, u_t2, u_s1, u_s2, u_a1, u_a2, u_a3):
             out += pack_u24_be(counts24_from_unit(u))
-
     return bytes(out)
 
 
@@ -349,7 +343,6 @@ def make_ttv_payload(t0_posix: float, fs: float, n_samples: int, phase: float = 
         out += struct.pack(">H", up_peak & 0xFFFF)
         out += struct.pack(">H", dn_peak & 0xFFFF)
         out += b"\r\n"
-
     return bytes(out)
 
 
@@ -377,20 +370,275 @@ def make_vnav_payload(t0_posix: float, fs: float, n_samples: int) -> bytes:
     return bytes(out)
 
 
-# -----------------------------
+# =============================================================================
+# SB49 synthesis: generate T,P,S sinusoids -> make raw ttttttccccccppppppvvvv\r\n
+# =============================================================================
+C3515_mScm = 42.914  # conductivity of seawater at S=35, T=15C, P=0 (mS/cm)
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
+def sb49_forward_temperature_C(T_raw: int, cal: DCAL) -> float:
+    # Matlab:
+    # mv = (T_raw-524288)/1.6e7
+    # r = (mv*2.295e10 + 9.216e8)./(6.144e4-mv*5.3e5)
+    # T = 1/(a0+a1*log(r)+a2*log(r)^2+a3*log(r)^3) - 273.15
+    mv = (float(T_raw) - 524288.0) / 1.6e7
+    denom = (6.144e4 - mv * 5.3e5)
+    if denom == 0:
+        denom = 1e-12
+    r = (mv * 2.295e10 + 9.216e8) / denom
+    if r <= 0:
+        r = 1e-12
+    lr = math.log(r)
+    invT = cal.TA0 + cal.TA1 * lr + cal.TA2 * (lr ** 2) + cal.TA3 * (lr ** 3)
+    if invT == 0:
+        invT = 1e-12
+    return (1.0 / invT) - 273.15
+
+
+def sb49_invert_temperature_raw(T_C: float, cal: DCAL) -> int:
+    """
+    Numerically invert sb49_forward_temperature_C over 24-bit raw range.
+    Uses bisection on T_raw (monotonic in practice for realistic ranges).
+    """
+    T_C = float(T_C)
+
+    lo = 0
+    hi = (1 << 24) - 1
+
+    # Try to ensure bracket. If not, still bisect but clamp outputs.
+    f_lo = sb49_forward_temperature_C(lo, cal) - T_C
+    f_hi = sb49_forward_temperature_C(hi, cal) - T_C
+
+    # If no sign change, pick nearest endpoint
+    if f_lo == 0:
+        return lo
+    if f_hi == 0:
+        return hi
+    if f_lo * f_hi > 0:
+        return lo if abs(f_lo) < abs(f_hi) else hi
+
+    for _ in range(60):
+        mid = (lo + hi) // 2
+        f_mid = sb49_forward_temperature_C(mid, cal) - T_C
+        if f_mid == 0:
+            return mid
+        if f_lo * f_mid <= 0:
+            hi = mid
+            f_hi = f_mid
+        else:
+            lo = mid
+            f_lo = f_mid
+    return (lo + hi) // 2
+
+
+def sb49_invert_pressure_raw(P_dbar: float, cal: DCAL, PT_raw: int) -> int:
+    """
+    Analytic inversion of the pressure calibration, assuming PT_raw is chosen.
+    Matlab:
+      y = PT_raw/13107
+      t = ptempa0 + ptempa1*y + ptempa2*y^2
+      x = P_raw - ptca0 - ptca1*t - ptca2*t^2
+      n = x*ptcb0 / (ptcb0 + ptcb1*t + ptcb2*t^2)
+      P = (pa0 + pa1*n + pa2*n^2 - 14.7)*0.689476
+    """
+    # Convert desired dbar back to psi polynomial value:
+    ppsi = (float(P_dbar) / 0.689476) + 14.7
+
+    y = float(PT_raw) / 13107.0
+    t = cal.PTEMPA0 + cal.PTEMPA1 * y + cal.PTEMPA2 * (y ** 2)
+
+    # Solve pa2*n^2 + pa1*n + (pa0 - ppsi) = 0
+    a = cal.PA2
+    b = cal.PA1
+    c = cal.PA0 - ppsi
+
+    if abs(a) < 1e-18:
+        # linear
+        if abs(b) < 1e-18:
+            n = 0.0
+        else:
+            n = -c / b
+    else:
+        disc = b * b - 4.0 * a * c
+        if disc < 0:
+            disc = 0.0
+        sqrt_disc = math.sqrt(disc)
+        n1 = (-b + sqrt_disc) / (2.0 * a)
+        n2 = (-b - sqrt_disc) / (2.0 * a)
+        # choose a "reasonable" root: prefer the one that is finite and closest to 0..1e7
+        # (pressure n scale depends on cal; this heuristic is fine for synthetic data)
+        candidates = [n1, n2]
+        n = min(candidates, key=lambda vv: abs(vv))
+
+    denom = (cal.PTCB0 + cal.PTCB1 * t + cal.PTCB2 * (t ** 2))
+    if denom == 0:
+        denom = 1e-12
+    x = n * denom / cal.PTCB0
+
+    P_raw = x + cal.PTCA0 + cal.PTCA1 * t + cal.PTCA2 * (t ** 2)
+
+    # clamp to 24-bit unsigned
+    P_raw_i = int(round(P_raw))
+    P_raw_i = max(0, min((1 << 24) - 1, P_raw_i))
+    return P_raw_i
+
+
+def sb49_invert_conductivity_raw(C_Sm: float, T_C: float, P_dbar: float, cal: DCAL) -> int:
+    """
+    Invert conductivity calibration:
+      f = C_raw/256/1000
+      C = (g + h f^2 + i f^3 + j f^4) / (1 + tcor*T + pcor*P)
+    Solve for f >= 0 numerically, then C_raw = f*256*1000
+    """
+    # effective target numerator:
+    denom_corr = 1.0 + cal.CTCOR * float(T_C) + cal.CPCOR * float(P_dbar)
+    if denom_corr == 0:
+        denom_corr = 1e-12
+    target = float(C_Sm) * denom_corr
+
+    # Define poly in f:
+    # g + h f^2 + i f^3 + j f^4 - target = 0
+    def poly(f: float) -> float:
+        return (cal.G + cal.H * (f ** 2) + cal.I * (f ** 3) + cal.J * (f ** 4) - target)
+
+    # Bracket f. Typical f is O(1..10). We expand until sign change or limit.
+    f_lo = 0.0
+    v_lo = poly(f_lo)
+    f_hi = 5.0
+    v_hi = poly(f_hi)
+
+    # expand hi if needed
+    for _ in range(40):
+        if v_lo == 0:
+            f_hi = f_lo
+            break
+        if v_lo * v_hi <= 0:
+            break
+        f_hi *= 1.5
+        v_hi = poly(f_hi)
+        if f_hi > 1e4:
+            break
+
+    # If no bracket, just pick best of endpoints
+    if v_lo * v_hi > 0:
+        f = f_lo if abs(v_lo) < abs(v_hi) else f_hi
+    else:
+        # bisection
+        lo = f_lo
+        hi = f_hi
+        vlo = v_lo
+        vhi = v_hi
+        f = 0.5 * (lo + hi)
+        for _ in range(80):
+            f = 0.5 * (lo + hi)
+            vm = poly(f)
+            if vm == 0:
+                break
+            if vlo * vm <= 0:
+                hi = f
+                vhi = vm
+            else:
+                lo = f
+                vlo = vm
+
+    C_raw = int(round(f * 256.0 * 1000.0))
+    C_raw = max(0, min((1 << 24) - 1, C_raw))
+    return C_raw
+
+
+def sb49_pack_sample(ts_ms: int, T_raw: int, C_raw: int, P_raw: int, PT_raw: int) -> bytes:
+    """
+    One raw sample block is 24 bytes:
+      tttttt cccccc pppppp vvvv \r\n
+    where:
+      T_raw, C_raw, P_raw are 24-bit hex (6 chars each)
+      PT_raw is 16-bit hex (4 chars)
+    """
+    s = f"{T_raw:06x}{C_raw:06x}{P_raw:06x}{PT_raw:04x}\r\n"
+    b = s.encode("ascii")
+    if len(b) != 24:
+        raise RuntimeError(f"SB49 sample length is {len(b)} bytes, expected 24")
+    return b
+
+
+def make_sb49_payload_from_TPS(
+    t0_posix: float,
+    fs: float,
+    n_samples: int,
+    dcal: DCAL,
+    # target signals:
+    T0_C: float = 10.0, T_amp: float = 0.5,
+    P0_dbar: float = 10.0, P_amp: float = 1.0,
+    S0_psu: float = 35.0, S_amp: float = 0.1,
+    wave_hz: float = 0.2,
+    PT_raw_fixed: int = 0x8000,
+) -> bytes:
+    """
+    Payload format (your spec):
+      For each element:
+        16 ASCII hex timestamp_ms + 24 bytes of raw (ttttttccccccppppppvvvv\\r\\n)
+    """
+    out = bytearray()
+
+    for k in range(n_samples):
+        t = t0_posix + k / fs
+        ts_ms = int(t * 1000.0)
+        ts_hex16 = f"{ts_ms:016x}".encode("ascii")
+
+        # Generate T, P, S sinusoids
+        ph = 2.0 * math.pi * wave_hz * (t - t0_posix)
+        T_C = T0_C + T_amp * math.sin(ph + 0.0)
+        P_dbar = P0_dbar + P_amp * math.sin(ph + 1.0)
+        S_psu = S0_psu + S_amp * math.sin(ph + 2.0)
+
+        # --- Convert (T,P,S) -> conductivity C (approx) ---
+        # You asked for S, but a robust exact inverse sw_salt is a lot of code.
+        # For synthetic data we use a simple approximation:
+        #   conductivity ratio ~ S/35, then C(S/m) = (ratio * C3515_mS/cm) / 10
+        cndr = _clamp(S_psu / 35.0, 0.0, 2.0)
+        C_mScm = cndr * C3515_mScm
+        C_Sm = C_mScm / 10.0  # because 1 S/m = 10 mS/cm
+
+        # --- Invert calibrations -> raw hex fields ---
+        T_raw = sb49_invert_temperature_raw(T_C, dcal)
+        P_raw = sb49_invert_pressure_raw(P_dbar, dcal, PT_raw_fixed)
+        C_raw = sb49_invert_conductivity_raw(C_Sm, T_C, P_dbar, dcal)
+
+        rec_ctd = sb49_pack_sample(ts_ms, T_raw, C_raw, P_raw, PT_raw_fixed)
+
+        out += ts_hex16
+        out += rec_ctd
+
+    return bytes(out)
+
+
+# =============================================================================
 # Run modes
-# -----------------------------
+# =============================================================================
 @dataclass
 class GenConfig:
     duration_s: float
     chunk_s: float
     realtime: bool
+    # per instrument sample rates
     efe4_fs: float
     ttv_fs: float
     vnav_fs: float
+    sb49_fs: float
 
 
-def run_generator(writer: Writer, cfg: GenConfig) -> None:
+def run_generator(writer: Writer, cfg: GenConfig, dcal: DCAL) -> None:
+    """
+    Generates mixed records interleaved over time.
+    SB49:
+      - sampling frequency = 16 Hz
+      - start with 2 elements per record
+      - each element: 16hex ts + 24 bytes raw sample
+    """
     t_start = time.time()
     t_end = t_start + cfg.duration_s
     next_chunk_start = t_start
@@ -400,6 +648,7 @@ def run_generator(writer: Writer, cfg: GenConfig) -> None:
         next_chunk_start = chunk_start + cfg.chunk_s
         t0_posix = chunk_start
 
+        # --- DC instruments you already had ---
         n_efe4 = max(1, int(round(cfg.efe4_fs * cfg.chunk_s)))
         efe4_payload = make_efe4_payload(t0_posix, cfg.efe4_fs, n_efe4)
         writer.write(build_modsom_record(b"EFE4", int(t0_posix * 1000.0), efe4_payload))
@@ -413,6 +662,22 @@ def run_generator(writer: Writer, cfg: GenConfig) -> None:
         vnav_payload = make_vnav_payload(t0_posix, cfg.vnav_fs, n_vnav)
         writer.write(build_modsom_record(b"VNAV", int(t0_posix * 1000.0), vnav_payload))
 
+        # --- NEW: SB49 (2 elements per record) ---
+        sb49_elements = 2
+        sb49_payload = make_sb49_payload_from_TPS(
+            t0_posix=t0_posix,
+            fs=cfg.sb49_fs,
+            n_samples=sb49_elements,
+            dcal=dcal,
+            # You can tweak these defaults later:
+            T0_C=10.0, T_amp=0.5,
+            P0_dbar=10.0, P_amp=1.0,
+            S0_psu=35.0, S_amp=0.1,
+            wave_hz=0.2,
+            PT_raw_fixed=0x8000,
+        )
+        writer.write(build_modsom_record(b"SB49", int(t0_posix * 1000.0), sb49_payload))
+
         writer.flush()
 
         if cfg.realtime:
@@ -424,9 +689,9 @@ def run_generator(writer: Writer, cfg: GenConfig) -> None:
     writer.flush()
 
 
-# -----------------------------
+# =============================================================================
 # CLI
-# -----------------------------
+# =============================================================================
 def parse_hostport(s: str) -> tuple[str, int]:
     if ":" not in s:
         raise ValueError("Expected host:port")
@@ -435,7 +700,7 @@ def parse_hostport(s: str) -> tuple[str, int]:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="MODSOM generator (file/serial/tcp share same writer backend)")
+    ap = argparse.ArgumentParser(description="MODSOM generator (file/serial/tcp) including DCAL + SB49")
 
     out = ap.add_mutually_exclusive_group(required=True)
     out.add_argument("--file", help="Write to a raw file, e.g. modsom_0.modraw")
@@ -453,6 +718,8 @@ def main():
     ap.add_argument("--ttv-fs", type=float, default=8.0, help="TTV sample rate (Hz)")
     ap.add_argument("--vnav-fs", type=float, default=10.0, help="VNAV sample rate (Hz)")
 
+    ap.add_argument("--sb49-fs", type=float, default=16.0, help="SB49 sample rate (Hz)")
+
     ap.add_argument("--no-dcal", action="store_true", help="Do not send DCAL at stream start")
 
     args = ap.parse_args()
@@ -464,6 +731,7 @@ def main():
         efe4_fs=float(args.efe4_fs),
         ttv_fs=float(args.ttv_fs),
         vnav_fs=float(args.vnav_fs),
+        sb49_fs=float(args.sb49_fs),
     )
 
     writer: Optional[Writer] = None
@@ -489,16 +757,15 @@ def main():
         else:
             ap.error("No output mode selected.")
 
-        # ---- build DCAL structure once; use it for DCAL record + later $SBE ----
+        # Build the DCAL structure once (and reuse for SB49 synthesis)
         dcal = dcal_from_example()
 
-        # ---- SEND DCAL ONCE AT START ----
         if not args.no_dcal:
             send_dcal_record(writer, dcal)
 
         print(f"[GEN] starting: duration={cfg.duration_s}s chunk={cfg.chunk_s}s realtime={cfg.realtime}")
-        print(f"[GEN] EFE4 fs={cfg.efe4_fs}Hz, TTV fs={cfg.ttv_fs}Hz, VNAV fs={cfg.vnav_fs}Hz")
-        run_generator(writer, cfg)
+        print(f"[GEN] EFE4 fs={cfg.efe4_fs}Hz, TTV fs={cfg.ttv_fs}Hz, VNAV fs={cfg.vnav_fs}Hz, SB49 fs={cfg.sb49_fs}Hz")
+        run_generator(writer, cfg, dcal)
         print("[GEN] done.")
 
     except KeyboardInterrupt:
