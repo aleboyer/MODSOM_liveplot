@@ -80,6 +80,13 @@ ADC_VREF_ACCEL = 1.8
 ACC_OFFSET = 1.8 / 2
 ACC_FACTOR = 0.4
 
+# =============================================================================
+# TTV conversion helpers (TTV1, TTV2, TTV3)
+# =============================================================================
+TTV_ANGLE_VERT2HOR = 53 # the TTV 53˚ to the Horizontal
+TTV_ANGLE_B1_VNAVX = 53 # the TTV beam1 to the VNAV X axis
+TTV_ANGLE_B2_VNAVX = 53 # the TTV beam2 to the VNAV X axis
+TTV_ANGLE_B3_VNAVX = 53 # the TTV beam3 to the VNAV X axis
 
 def bytes3_to_signed_int(b: bytes) -> int:
     if len(b) != 3:
@@ -482,7 +489,6 @@ class TTVData(BaseInstrumentData):
             self.errorcode: List[int] = []
             self.upstream_adcpeak: List[int] = []
             self.downstream_adcpeak: List[int] = []
-            self.beam_vel: List[float] = []
             self.raw_payloads: List[bytes] = []
         else:
             self.tof_up = RingBuffer(ring_capacity, dtype=np.float64)
@@ -491,8 +497,37 @@ class TTVData(BaseInstrumentData):
             self.errorcode = RingBuffer(ring_capacity, dtype=np.float64)  # store as float for plotting
             self.upstream_adcpeak = RingBuffer(ring_capacity, dtype=np.float64)
             self.downstream_adcpeak = RingBuffer(ring_capacity, dtype=np.float64)
-            self.beam_vel = RingBuffer(ring_capacity, dtype=np.float64)
             self.raw_payloads = RingBytes(50)
+
+class TTVProcessedData(BaseInstrumentData):
+    def __init__(self, file_mode: bool, ring_capacity: int):
+        super().__init__(file_mode, ring_capacity)
+        if file_mode:
+            self.ttv1_posix: List[float] = []
+            self.ttv2_posix: List[float] = []
+            self.ttv3_posix: List[float] = []
+            self.beam1_vel: List[float] = []
+            self.beam2_vel: List[float] = []
+            self.beam3_vel: List[float] = []
+            self.velZ1: List[float] = []
+            self.velZ2: List[float] = []
+            self.velZ3: List[float] = []
+            self.velU1: List[float] = []
+            self.velU2: List[float] = []
+            self.velU3: List[float] = []
+        else:
+            self.ttv1_posix = RingBuffer(ring_capacity, dtype=np.float64)
+            self.ttv2_posix = RingBuffer(ring_capacity, dtype=np.float64)
+            self.ttv3_posix = RingBuffer(ring_capacity, dtype=np.float64)
+            self.beam1_vel  = RingBuffer(ring_capacity, dtype=np.float64)
+            self.beam2_vel  = RingBuffer(ring_capacity, dtype=np.float64)
+            self.beam3_vel  = RingBuffer(ring_capacity, dtype=np.float64)
+            self.velZ1      = RingBuffer(ring_capacity, dtype=np.float64)
+            self.velZ2      = RingBuffer(ring_capacity, dtype=np.float64)
+            self.velZ3      = RingBuffer(ring_capacity, dtype=np.float64)
+            self.velU1      = RingBuffer(ring_capacity, dtype=np.float64)
+            self.velU2      = RingBuffer(ring_capacity, dtype=np.float64)
+            self.velU3      = RingBuffer(ring_capacity, dtype=np.float64)
 
 
 class SB49Data(BaseInstrumentData):
@@ -887,6 +922,8 @@ class RecordProcessorThread(threading.Thread):
 
         self.sb49_cal: Optional[SBE49Cal] = None
 
+        self.process_data: Dict[str,BaseInstrumentData] = {"TTV": TTVProcessedData(file_mode, cap_ttv)}
+
     def run(self):
         while not self.stop_event.is_set():
             rec = self.in_queue.get()
@@ -1053,7 +1090,6 @@ class RecordProcessorThread(threading.Thread):
             err = np.empty(n_packets, dtype=np.float64)
             upk = np.empty(n_packets, dtype=np.float64)
             dpk = np.empty(n_packets, dtype=np.float64)
-            bvel = np.empty(n_packets, dtype=np.float64)
 
             for i in range(n_packets):
                 offset = i * PACKET_SIZE
@@ -1066,7 +1102,6 @@ class RecordProcessorThread(threading.Thread):
                     err = err[:i]
                     upk = upk[:i]
                     dpk = dpk[:i]
-                    bvel = bvel[:i]
                     break
 
                 ts_hex_bytes = chunk[0:16]
@@ -1099,11 +1134,6 @@ class RecordProcessorThread(threading.Thread):
                 upk[i] = float(int(up))
                 dpk[i] = float(int(dn))
 
-                if u <= 0 or d <= 0:
-                    bvel[i] = 0.0
-                else:
-                    bvel[i] = (TTV_SPACE / 2.0) * dt / (u * d)
-
             inst.sample_posix.extend(ts)
             inst.sample_dnum.extend(ts / SECONDS_PER_DAY + MATLAB_EPOCH_DNUM)
             inst.tof_up.extend(tof_up)
@@ -1112,7 +1142,6 @@ class RecordProcessorThread(threading.Thread):
             inst.errorcode.extend(err)
             inst.upstream_adcpeak.extend(upk)
             inst.downstream_adcpeak.extend(dpk)
-            inst.beam_vel.extend(bvel)
             return
 
         # file_mode lists
@@ -1144,10 +1173,10 @@ class RecordProcessorThread(threading.Thread):
             downstream_adcpeak = struct.unpack(">H", chunk[idx : idx + 2])[0]
             idx += 2
 
-            if tof_up <= 0 or tof_down <= 0:
-                beam_vel = 0.0
-            else:
-                beam_vel = (TTV_SPACE / 2.0) * dtof / (tof_up * tof_down)
+            # if tof_up <= 0 or tof_down <= 0:
+            #     beam_vel = 0.0
+            # else:
+            #     beam_vel = (TTV_SPACE / 2.0) * dtof / (tof_up * tof_down)
 
             inst.tof_up.append(float(tof_up))
             inst.tof_down.append(float(tof_down))
@@ -1155,7 +1184,7 @@ class RecordProcessorThread(threading.Thread):
             inst.errorcode.append(int(errorcode))
             inst.upstream_adcpeak.append(int(upstream_adcpeak))
             inst.downstream_adcpeak.append(int(downstream_adcpeak))
-            inst.beam_vel.append(float(beam_vel))
+
 
     def _parse_sb49_record(self, rec: Record, inst: SB49Data):
         inst._append_record_time(rec.posix, rec.dnum)
@@ -1394,6 +1423,118 @@ class RecordProcessorThread(threading.Thread):
             inst.raw_payloads.append(rec.payload)  # type: ignore[attr-defined]
 
 
+class DataProcessingThread(threading.Thread):
+    def __init__(self, instruments: Dict[str, BaseInstrumentData], processed: Dict[str, BaseInstrumentData],
+                 stop_event: threading.Event, file_mode: bool):
+        super().__init__(daemon=True)
+        self.instruments = instruments
+        self.processed = processed
+        self.stop_event = stop_event
+        self.file_mode = file_mode
+        self.last_t = {"TTV1": None, "TTV2": None, "TTV3": None}  # type: ignore[assignment]
+
+        # flag the GUI can poll to open windows
+        self.ttv_ready_event = threading.Event()
+
+    def run(self):
+        while not self.stop_event.is_set():
+            self._process_ttv()
+            time.sleep(0.05)  # ~20 Hz processing; tune as desired
+
+    def _get_arr(self, inst: TTVData, name: str) -> np.ndarray:
+        v = getattr(inst, name)
+        if inst.file_mode:
+            return np.asarray(v, dtype=float)
+        return v.get()
+
+    def _append_proc(self, proc: TTVProcessedData, tag: str, t_new: np.ndarray, bv_new: np.ndarray, bu_new: np.ndarray, bz_new: np.ndarray):
+        if t_new.size == 0:
+            return
+        if proc.file_mode:
+            if tag == "TTV1":
+                proc.ttv1_posix.extend(t_new.tolist())
+                proc.beam1_vel.extend(bv_new.tolist())
+                proc.velZ1.extend(bz_new.tolist())
+                proc.velU1.extend(bu_new.tolist())
+            elif tag == "TTV2":
+                proc.ttv2_posix.extend(t_new.tolist())
+                proc.beam2_vel.extend(bv_new.tolist())
+                proc.velZ2.extend(bz_new.tolist())
+                proc.velU2.extend(bu_new.tolist())
+            else:
+                proc.ttv3_posix.extend(t_new.tolist())
+                proc.beam3_vel.extend(bv_new.tolist())
+                proc.velZ3.extend(bz_new.tolist())
+                proc.velU3.extend(bu_new.tolist())
+        else:
+            if tag == "TTV1":
+                proc.ttv1_posix.extend(t_new)
+                proc.beam1_vel.extend(bv_new)
+                proc.velZ1.extend(bz_new.tolist())
+                proc.velU1.extend(bu_new.tolist())
+            elif tag == "TTV2":
+                proc.ttv2_posix.extend(t_new)
+                proc.beam2_vel.extend(bv_new)
+                proc.velZ2.extend(bz_new.tolist())
+                proc.velU2.extend(bu_new.tolist())
+            else:
+                proc.ttv3_posix.extend(t_new)
+                proc.beam3_vel.extend(bv_new)
+                proc.velZ3.extend(bz_new.tolist())
+                proc.velU3.extend(bu_new.tolist())
+
+    def _process_ttv(self):
+        proc = self.processed.get("TTV")
+        if not isinstance(proc, TTVProcessedData):
+            return
+
+        for tag in ("TTV1", "TTV2", "TTV3"):
+            inst = self.instruments.get(tag)
+            if not isinstance(inst, TTVData):
+                continue
+
+            t = inst.get_sample_posix()
+            if t.size < 2:
+                continue
+
+            tof_up = self._get_arr(inst, "tof_up")
+            tof_dn = self._get_arr(inst, "tof_down")
+            dtof   = self._get_arr(inst, "dtof")
+            if tof_up.size != t.size or tof_dn.size != t.size or dtof.size != t.size:
+                continue
+
+            lt = self.last_t[tag]
+            if lt is None:
+                idx0 = 0
+            else:
+                idx0 = np.searchsorted(t, lt, side="right")
+
+            if idx0 >= t.size:
+                continue
+
+            t_new = t[idx0:]
+            u = tof_up[idx0:]
+            d = tof_dn[idx0:]
+            dt = dtof[idx0:]
+
+            # beam velocity formula (vectorized)
+            bv = np.zeros_like(dt, dtype=np.float64)
+            bz = np.zeros_like(dt, dtype=np.float64)
+            bu = np.zeros_like(dt, dtype=np.float64)
+            m = (u > 0) & (d > 0)
+            bv[m] = (TTV_SPACE / 2.0) * dt[m] / (u[m] * d[m])
+            bz[m] = bv[m]*math.cos(TTV_ANGLE_VERT2HOR)
+            bu[m] = bv[m]*math.sin(TTV_ANGLE_VERT2HOR)
+
+
+            self._append_proc(proc, tag, t_new, bv, bz, bu)
+
+            self.last_t[tag] = float(t_new[-1])
+
+            # “ready” once we have some processed points
+            self.ttv_ready_event.set()
+
+
 # =============================================================================
 # GUI helpers
 # =============================================================================
@@ -1490,6 +1631,7 @@ class EFE4Window(QtWidgets.QMainWindow):
         self.sp_widget.setLabel("left", "PSD")
         self.sp_widget.setLabel("bottom", "f", "Hz")
         self.sp_widget.setLogMode(x=True, y=True)
+        self.sp_widget.showGrid(x=True, y=True, alpha=0.25)
         self.sp_widget.addLegend()
         right_layout.addWidget(self.sp_widget)
 
@@ -1583,7 +1725,6 @@ class TTVWindow(QtWidgets.QMainWindow):
             "errorcode",
             "upstream_adcpeak",
             "downstream_adcpeak",
-            "beam_vel",
         ]
 
         self.ts_curves: Dict[str, Dict[str, pg.PlotDataItem]] = {}
@@ -1604,6 +1745,7 @@ class TTVWindow(QtWidgets.QMainWindow):
         self.sp_widget.setLabel("left", "PSD")
         self.sp_widget.setLabel("bottom", "f", "Hz")
         self.sp_widget.setLogMode(x=True, y=True)
+        self.sp_widget.showGrid(x=True, y=True, alpha=0.25)
         self.sp_widget.addLegend()
         right_layout.addWidget(self.sp_widget)
 
@@ -1700,6 +1842,116 @@ class TTVWindow(QtWidgets.QMainWindow):
                 if f is not None:
                     self.sp_curves[(tag, ch)].setData(f, psd)
 
+class TTVProcessedWindow(QtWidgets.QMainWindow):
+    def __init__(self, proc: TTVProcessedData, use_full_series: bool):
+        super().__init__()
+        self.proc = proc
+        self.use_full_series = use_full_series
+        self.window_seconds = 5.0
+        self.setWindowTitle("TTV Processed – beam velocities")
+
+        self.max_plot_points_live = 3000
+        self.max_plot_points_file = 20000
+
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        layout = QtWidgets.QVBoxLayout(central)
+
+        self.p = pg.PlotWidget()
+        self.p.setLabel("left", "beam velocity", "m/s")
+        self.p.setLabel("bottom", "time", "s")
+        self.p.addLegend()
+        layout.addWidget(self.p)
+
+        self.p1 = pg.PlotWidget()
+        self.p1.setLabel("left", " velocity Z", "m/s")
+        self.p1.setLabel("bottom", "time", "s")
+        self.p1.addLegend()
+        layout.addWidget(self.p1)
+
+        self.p2 = pg.PlotWidget()
+        self.p2.setLabel("left", " velocity U", "m/s")
+        self.p2.setLabel("bottom", "time", "s")
+        self.p2.addLegend()
+        layout.addWidget(self.p2)
+
+        self.c1 = self.p.plot([], [], pen=pg.mkPen((255,0,0)), name="beam1")
+        self.c2 = self.p.plot([], [], pen=pg.mkPen((0,255,0)), name="beam2")
+        self.c3 = self.p.plot([], [], pen=pg.mkPen((0,0,255)), name="beam3")
+
+        self.c4 = self.p1.plot([], [], pen=pg.mkPen((255,0,0)), name="Z1")
+        self.c5 = self.p1.plot([], [], pen=pg.mkPen((0,255,0)), name="Z2")
+        self.c6 = self.p1.plot([], [], pen=pg.mkPen((0,0,255)), name="Z3")
+
+        self.c7 = self.p2.plot([], [], pen=pg.mkPen((255,0,0)), name="U1")
+        self.c8 = self.p2.plot([], [], pen=pg.mkPen((0,255,0)), name="U2")
+        self.c9 = self.p2.plot([], [], pen=pg.mkPen((0,0,255)), name="U3")
+
+
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.update_plots)
+        self.timer.start(100)
+
+    def _get(self, name: str) -> np.ndarray:
+        v = getattr(self.proc, name)
+        if self.proc.file_mode:
+            return np.asarray(v, dtype=float)
+        return v.get()
+
+    def update_plots(self):
+        max_pts = self.max_plot_points_file if self.use_full_series else self.max_plot_points_live
+
+        # beam1
+        t1 = self._get("ttv1_posix");
+        y1 = self._get("beam1_vel")
+        z1 = self._get("velZ1")
+        u1 = self._get("velU1")
+
+        if t1.size >= 2 and y1.size == t1.size:
+            if self.use_full_series:
+                mask = np.ones_like(t1, dtype=bool)
+            else:
+                mask = _slice_last_window(t1, self.window_seconds)
+            tw = t1[mask]; yr = y1[mask];zr = z1[mask];ur = u1[mask]
+            if tw.size >= 2:
+                x = tw - tw[0]
+                xx, yy = _decimate_xy(x, yr, max_pts)
+                xx, zz = _decimate_xy(x, zr, max_pts)
+                xx, uu = _decimate_xy(x, ur, max_pts)
+                self.c1.setData(xx, yy)
+                self.c4.setData(xx, zz)
+                self.c7.setData(xx, uu)
+
+        # beam2
+        t2 = self._get("ttv2_posix"); y2 = self._get("beam2_vel")
+        z2 = self._get("velZ2");u2 = self._get("velU2")
+        if t2.size >= 2 and y2.size == t2.size:
+            mask = np.ones_like(t2, dtype=bool) if self.use_full_series else _slice_last_window(t2, self.window_seconds)
+            tw = t2[mask]; yr = y2[mask];zr = z2[mask];ur = u2[mask];
+            if tw.size >= 2:
+                x = tw - tw[0]
+                xx, yy = _decimate_xy(x, yr, max_pts)
+                xx, zz = _decimate_xy(x, zr, max_pts)
+                xx, uu = _decimate_xy(x, ur, max_pts)
+                self.c2.setData(xx, yy)
+                self.c5.setData(xx, zz)
+                self.c8.setData(xx, uu)
+
+        # beam3
+        t3 = self._get("ttv3_posix"); y3 = self._get("beam3_vel")
+        z3 = self._get("velZ3");u3 = self._get("velU3")
+        if t3.size >= 2 and y3.size == t3.size:
+            mask = np.ones_like(t3, dtype=bool) if self.use_full_series else _slice_last_window(t3, self.window_seconds)
+            tw = t3[mask]; yr = y3[mask]
+            zr = z3[mask]; ur = u3[mask]
+            if tw.size >= 2:
+                x = tw - tw[0]
+                xx, yy = _decimate_xy(x, yr, max_pts)
+                xx, zz = _decimate_xy(x, zr, max_pts)
+                xx, uu = _decimate_xy(x, ur, max_pts)
+                self.c3.setData(xx, yy)
+                self.c6.setData(xx, zz)
+                self.c9.setData(xx, uu)
 
 class VNAVWindow(QtWidgets.QMainWindow):
     def __init__(self, inst_data: VNAVData, use_full_series: bool):
@@ -1752,6 +2004,7 @@ class VNAVWindow(QtWidgets.QMainWindow):
         self.sp_widget.setLabel("left", "PSD")
         self.sp_widget.setLabel("bottom", "f", "Hz")
         self.sp_widget.setLogMode(x=True, y=True)
+        self.sp_widget.showGrid(x=True, y=True, alpha=0.25)
         self.sp_widget.addLegend()
         right_layout.addWidget(self.sp_widget)
 
@@ -1859,6 +2112,7 @@ class SB49Window(QtWidgets.QMainWindow):
         self.sp_widget.setLabel("left", "PSD")
         self.sp_widget.setLabel("bottom", "f", "Hz")
         self.sp_widget.setLogMode(x=True, y=True)
+        self.sp_widget.showGrid(x=True, y=True, alpha=0.25)
         self.sp_widget.addLegend()
         right_layout.addWidget(self.sp_widget)
 
@@ -1925,15 +2179,17 @@ class SB49Window(QtWidgets.QMainWindow):
 # Window manager
 # =============================================================================
 class InstrumentWindowManager(QtCore.QObject):
-    def __init__(self, record_processor: RecordProcessorThread, use_full_series: bool, parent=None):
+    def __init__(self, record_processor: RecordProcessorThread,data_processor: DataProcessingThread, use_full_series: bool, parent=None):
         super().__init__(parent)
         self.record_processor = record_processor
+        self.data_processor = data_processor
         self.use_full_series = use_full_series
 
         self.efe4_window: Optional[EFE4Window] = None
         self.ttv_window: Optional[TTVWindow] = None
         self.vnav_window: Optional[VNAVWindow] = None
         self.sb49_window: Optional[SB49Window] = None
+        self.ttv_proc_window: Optional[TTVProcessedWindow] = None
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.check_instruments)
@@ -1970,6 +2226,14 @@ class InstrumentWindowManager(QtCore.QObject):
             if isinstance(sb49, SB49Data) and sb49.get_sample_posix().size:
                 self.sb49_window = SB49Window(sb49, self.use_full_series)
                 self.sb49_window.show()
+
+        proc = self.record_processor.process_data.get("TTV")
+        if self.ttv_proc_window is None and isinstance(proc, TTVProcessedData):
+            # optional: only open once processing has actually produced something
+            # use the thread’s event:
+            if self.data_processor.ttv_ready_event.is_set():
+                self.ttv_proc_window = TTVProcessedWindow(proc, self.use_full_series)
+                self.ttv_proc_window.show()
 
 
 # =============================================================================
@@ -2014,12 +2278,27 @@ def main():
 
     byte_queue: queue.Queue = queue.Queue()
     record_queue: queue.Queue = queue.Queue()
+    process_queue: queue.Queue = queue.Queue()
     stop_event = threading.Event()
 
     file_mode = bool(args.file)
 
+    # processed container already exists inside record_processor
+    # make sure TTVProcessedData exists:
+    # record_processor.process_data["TTV"] = TTVProcessedData(file_mode, cap_ttv)
+
+
     record_processor = RecordProcessorThread(record_queue, stop_event, file_mode=file_mode)
     record_processor.start()
+
+    data_proc = DataProcessingThread(
+        instruments=record_processor.instruments,
+        processed=record_processor.process_data,
+        stop_event=stop_event,
+        file_mode=file_mode,
+    )
+    data_proc.start()
+
 
     parser = EpsiStateMachineParser(record_queue)
     parser_thread = ParserThread(byte_queue, parser, record_queue, stop_event)
@@ -2062,8 +2341,7 @@ def main():
         source_thread.start()
 
     # -------- plotting manager --------
-    manager = InstrumentWindowManager(record_processor, use_full_series)
-
+    manager = InstrumentWindowManager(record_processor,data_proc, use_full_series)
     # -------- unified quit path --------
     def request_quit():
         QtCore.QTimer.singleShot(0, app.quit)
@@ -2093,6 +2371,10 @@ def main():
         try:
             record_queue.put(None)
             record_processor.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            data_proc.join(timeout=1.0)
         except Exception:
             pass
 
