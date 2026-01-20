@@ -1523,6 +1523,7 @@ class DataProcessingThread(threading.Thread):
             bu = np.zeros_like(dt, dtype=np.float64)
             m = (u > 0) & (d > 0)
             bv[m] = (TTV_SPACE / 2.0) * dt[m] / (u[m] * d[m])
+            #Check the sin/cos ofr Z1,Z2,Z3 and U1,U2,U3
             bz[m] = bv[m]*math.cos(TTV_ANGLE_VERT2HOR)
             bu[m] = bv[m]*math.sin(TTV_ANGLE_VERT2HOR)
 
