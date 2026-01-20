@@ -590,9 +590,11 @@ def make_sb49_payload_from_TPS(
         ts_hex16 = f"{ts_ms:016x}".encode("ascii")
 
         # Generate T, P, S sinusoids
-        ph = 2.0 * math.pi * wave_hz * (t - t0_posix)
+        ph = 2.0 * math.pi * wave_hz * (t)
         T_C = T0_C + T_amp * math.sin(ph + 0.0)
-        P_dbar = P0_dbar + P_amp * math.sin(ph + 1.0)
+        ph_P = 2.0 * math.pi * .1*wave_hz * (t)
+        P_dbar = P0_dbar + P_amp * math.sin(ph_P + 1.0)
+        print(t)
         S_psu = S0_psu + S_amp * math.sin(ph + 2.0)
 
         # --- Convert (T,P,S) -> conductivity C (approx) ---
@@ -671,9 +673,9 @@ def run_generator(writer: Writer, cfg: GenConfig, dcal: DCAL) -> None:
             dcal=dcal,
             # You can tweak these defaults later:
             T0_C=10.0, T_amp=0.5,
-            P0_dbar=10.0, P_amp=1.0,
+            P0_dbar=100.0, P_amp=50.0,
             S0_psu=35.0, S_amp=0.1,
-            wave_hz=0.2,
+            wave_hz=0.1,
             PT_raw_fixed=0x8000,
         )
         writer.write(build_modsom_record(b"SB49", int(t0_posix * 1000.0), sb49_payload))
