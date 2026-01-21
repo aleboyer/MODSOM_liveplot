@@ -499,6 +499,7 @@ class TTVData(BaseInstrumentData):
             self.downstream_adcpeak = RingBuffer(ring_capacity, dtype=np.float64)
             self.raw_payloads = RingBytes(50)
 
+#TODO change TTVProcessedData to TTVBodyFrame
 class TTVProcessedData(BaseInstrumentData):
     def __init__(self, file_mode: bool, ring_capacity: int):
         super().__init__(file_mode, ring_capacity)
@@ -677,6 +678,7 @@ class ByteSourceThread(threading.Thread):
 # =============================================================================
 # Parser: state machine (prints kept)
 # =============================================================================
+#change EpsiStateMachineParser to MODSOMStateMachineParser
 class EpsiStateMachineParser:
     """
     $TAG tttttttttttttttt AAAAAAAA *CC <payload> *PP
@@ -1129,7 +1131,10 @@ class RecordProcessorThread(threading.Thread):
 
                 tof_up[i] = float(u)
                 tof_dn[i] = float(d)
-                dtof[i] = float(dt)
+                if tag=="TTV1":
+                    dtof[i] = float(dt)+400
+                else:
+                    dtof[i] = float(dt)
                 err[i] = float(int(e))
                 upk[i] = float(int(up))
                 dpk[i] = float(int(dn))
