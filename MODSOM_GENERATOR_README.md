@@ -35,7 +35,8 @@ Instrument	Tag	Status
 Epsilometer	EFE4	Fully implemented
 Travel-Time Velocimetry	TTV1, TTV2, TTV3	Fully implemented
 VectorNav VN-100	VNAV	$VNMAR ASCII samples
-SeaBird CTD	SB49, SB41	Placeholder
+SeaBird CTD	SB49, SB41	
+Seabird SB41 Placeholder 
 ECO-Puck	ECOP	Placeholder
 SOM controller	SOM3	Placeholder
 4. Data Characteristics
